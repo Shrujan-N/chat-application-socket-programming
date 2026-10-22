@@ -19,6 +19,7 @@ is_typing = False
 
 def send_event(client, event):
     data = json.dumps(event) + "\n"
+
     with send_lock:
         client.sendall(data.encode("utf-8"))
 
@@ -33,6 +34,7 @@ def stop_typing(client):
 
         if is_typing:
             is_typing = False
+
             try:
                 send_event(client, {"type": "stop_typing"})
             except OSError:
@@ -44,8 +46,10 @@ def typing_timeout(client):
 
     with typing_lock:
         typing_timer = None
+
         if is_typing:
             is_typing = False
+
             try:
                 send_event(client, {"type": "stop_typing"})
             except OSError:
@@ -65,6 +69,7 @@ def handle_text_change(buffer, client):
         if not current_text or current_text.startswith("/"):
             if is_typing:
                 is_typing = False
+
                 try:
                     send_event(client, {"type": "stop_typing"})
                 except OSError:
@@ -73,13 +78,18 @@ def handle_text_change(buffer, client):
 
         if not is_typing:
             is_typing = True
+
             try:
                 send_event(client, {"type": "typing"})
             except OSError:
                 is_typing = False
                 return
 
-        typing_timer = threading.Timer(1.5, typing_timeout, args=(client,))
+        typing_timer = threading.Timer(
+            1.5,
+            typing_timeout,
+            args=(client,)
+        )
         typing_timer.daemon = True
         typing_timer.start()
 
@@ -105,38 +115,59 @@ def receive_messages(reader, client, stop_event):
             if event_type == "text":
                 print(f"\n{event.get('message', '')}")
 
-            elif event_type == "private_message":
+            elif event_type in ("private_message", "group_message"):
                 message_id = event.get("message_id")
                 sender = event.get("sender", "Unknown")
                 message = event.get("message", "")
 
-                print(f"\n[Private] {sender}: {message}")
+                if event_type == "group_message":
+                    group_name = event.get("group", "Unknown")
+                    print(
+                        f"\n[Group: {group_name}] {sender}: {message}"
+                    )
+                else:
+                    print(f"\n[Private] {sender}: {message}")
 
-                send_event(client, {
-                    "type": "delivered",
-                    "message_id": message_id
-                })
+                if message_id:
+                    try:
+                        send_event(client, {
+                            "type": "delivered",
+                            "message_id": message_id
+                        })
+                    except OSError:
+                        pass
 
             elif event_type == "typing":
-                print(f"\n{event.get('username', 'Someone')} is typing...")
+                print(
+                    f"\n{event.get('username', 'Someone')} is typing..."
+                )
 
             elif event_type == "stop_typing":
-                print(f"\n{event.get('username', 'Someone')} stopped typing.")
+                print(
+                    f"\n{event.get('username', 'Someone')} "
+                    "stopped typing."
+                )
 
             elif event_type == "status":
                 message_id = event.get("message_id")
                 status = event.get("status", "unknown")
 
-                with status_lock:
-                    pending_status[message_id] = status
+                if message_id:
+                    with status_lock:
+                        pending_status[message_id] = status
+                    short_id = message_id[:8]
+                else:
+                    short_id = "Unknown"
 
                 if status == "sent":
-                    print(f"\nMessage {message_id[:8]}: Sent ✓")
+                    print(f"\nMessage {short_id}: Sent ✓")
+
                 elif status == "delivered":
-                    print(f"\nMessage {message_id[:8]}: Delivered ✓✓")
+                    print(f"\nMessage {short_id}: Delivered ✓✓")
+
                 elif status == "failed":
                     print(
-                        f"\nMessage {message_id[:8]}: Failed — "
+                        f"\nMessage {short_id}: Failed — "
                         f"{event.get('message', 'Delivery failed')}"
                     )
 
@@ -157,7 +188,14 @@ def start_client():
         reader = client.makefile("r", encoding="utf-8")
 
         print("Connected to the chat server.")
-        initial_response = json.loads(reader.readline())
+
+        initial_line = reader.readline()
+
+        if not initial_line:
+            print("The server closed the connection.")
+            return
+
+        initial_response = json.loads(initial_line)
         print(initial_response.get("message", initial_response))
 
         username = input("Username: ").strip()
@@ -169,14 +207,19 @@ def start_client():
         client.sendall((username + "\n").encode("utf-8"))
 
         response_line = reader.readline()
+
         if not response_line:
             print("The server closed the connection.")
             return
 
         response = json.loads(response_line)
-        print(response.get("message", response))
+        response_message = response.get("message", response)
+        print(response_message)
 
-        if response.get("message", "").startswith("ERROR:"):
+        if (
+            isinstance(response_message, str)
+            and response_message.startswith("ERROR:")
+        ):
             return
 
         session = PromptSession()
@@ -193,9 +236,16 @@ def start_client():
 
         print("\nCommands:")
         print("/contacts - View online users")
-        print("/chat username - Start a private chat")
-        print("/back - Leave the private chat")
+        print("/chat username - Select a private chat")
+        print("/group-create name user1,user2 - Create a group")
+        print("/groups - View your groups")
+        print("/group name - Enter a group chat")
+        print("/back - Leave the active chat")
         print("/quit - Disconnect")
+        print(
+            "\nOffline messages are queued in server memory "
+            "until acknowledged."
+        )
 
         while True:
             try:
@@ -206,13 +256,21 @@ def start_client():
             stop_typing(client)
 
             if message.lower() == "/quit":
-                send_event(client, {
-                    "type": "command",
-                    "message": "/quit"
-                })
+                try:
+                    send_event(client, {
+                        "type": "command",
+                        "message": "/quit"
+                    })
+                except OSError:
+                    pass
                 break
 
-            if message in ("/contacts", "/back") or message.startswith("/chat "):
+            if (
+                message in ("/contacts", "/back", "/groups")
+                or message.startswith("/chat ")
+                or message.startswith("/group ")
+                or message.startswith("/group-create ")
+            ):
                 send_event(client, {
                     "type": "command",
                     "message": message
@@ -234,8 +292,10 @@ def start_client():
 
     except ConnectionRefusedError:
         print("Could not connect. Start the server first.")
+
     except (ConnectionResetError, OSError, ValueError) as error:
         print(f"Connection error: {error}")
+
     finally:
         stop_event.set()
         stop_typing(client)
@@ -245,7 +305,10 @@ def start_client():
         except OSError:
             pass
 
-        client.close()
+        try:
+            client.close()
+        except OSError:
+            pass
 
         if reader is not None:
             try:
