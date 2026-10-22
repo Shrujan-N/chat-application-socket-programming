@@ -71,16 +71,16 @@ def handle_client(connection, address):
                     target = active_chats.get(username)
                     target_connection = clients.get(target) if target else None
 
+                message_id = event.get("message_id") or str(uuid.uuid4())
+
                 if not target or not target_connection:
                     send_event(connection, {
                         "type": "status",
-                        "message_id": event.get("message_id"),
+                        "message_id": message_id,
                         "status": "failed",
                         "message": "No active private chat."
                     })
                     continue
-
-                message_id = event.get("message_id") or str(uuid.uuid4())
 
                 with clients_lock:
                     pending_messages[message_id] = {
@@ -129,6 +129,17 @@ def handle_client(connection, address):
                         "type": "status",
                         "message_id": message_id,
                         "status": "delivered"
+                    })
+
+            elif event_type in ("typing", "stop_typing"):
+                with clients_lock:
+                    target = active_chats.get(username)
+                    target_connection = clients.get(target) if target else None
+
+                if target_connection:
+                    send_event(target_connection, {
+                        "type": event_type,
+                        "username": username
                     })
 
             elif event_type == "command":

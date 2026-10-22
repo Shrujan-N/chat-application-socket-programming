@@ -4,16 +4,84 @@ import socket
 import threading
 import uuid
 
+from prompt_toolkit import PromptSession
+
 HOST = "127.0.0.1"
 PORT = 5000
 
 pending_status = {}
 status_lock = threading.Lock()
+send_lock = threading.Lock()
+typing_lock = threading.Lock()
+typing_timer = None
+is_typing = False
 
 
 def send_event(client, event):
     data = json.dumps(event) + "\n"
-    client.sendall(data.encode("utf-8"))
+    with send_lock:
+        client.sendall(data.encode("utf-8"))
+
+
+def stop_typing(client):
+    global is_typing, typing_timer
+
+    with typing_lock:
+        if typing_timer is not None:
+            typing_timer.cancel()
+            typing_timer = None
+
+        if is_typing:
+            is_typing = False
+            try:
+                send_event(client, {"type": "stop_typing"})
+            except OSError:
+                pass
+
+
+def typing_timeout(client):
+    global is_typing, typing_timer
+
+    with typing_lock:
+        typing_timer = None
+        if is_typing:
+            is_typing = False
+            try:
+                send_event(client, {"type": "stop_typing"})
+            except OSError:
+                pass
+
+
+def handle_text_change(buffer, client):
+    global is_typing, typing_timer
+
+    current_text = buffer.text
+
+    with typing_lock:
+        if typing_timer is not None:
+            typing_timer.cancel()
+            typing_timer = None
+
+        if not current_text or current_text.startswith("/"):
+            if is_typing:
+                is_typing = False
+                try:
+                    send_event(client, {"type": "stop_typing"})
+                except OSError:
+                    pass
+            return
+
+        if not is_typing:
+            is_typing = True
+            try:
+                send_event(client, {"type": "typing"})
+            except OSError:
+                is_typing = False
+                return
+
+        typing_timer = threading.Timer(1.5, typing_timeout, args=(client,))
+        typing_timer.daemon = True
+        typing_timer.start()
 
 
 def receive_messages(reader, client, stop_event):
@@ -48,6 +116,12 @@ def receive_messages(reader, client, stop_event):
                     "type": "delivered",
                     "message_id": message_id
                 })
+
+            elif event_type == "typing":
+                print(f"\n{event.get('username', 'Someone')} is typing...")
+
+            elif event_type == "stop_typing":
+                print(f"\n{event.get('username', 'Someone')} stopped typing.")
 
             elif event_type == "status":
                 message_id = event.get("message_id")
@@ -105,6 +179,11 @@ def start_client():
         if response.get("message", "").startswith("ERROR:"):
             return
 
+        session = PromptSession()
+        session.default_buffer.on_text_changed += (
+            lambda buffer: handle_text_change(buffer, client)
+        )
+
         receiver = threading.Thread(
             target=receive_messages,
             args=(reader, client, stop_event),
@@ -119,7 +198,12 @@ def start_client():
         print("/quit - Disconnect")
 
         while True:
-            message = input("You: ").strip()
+            try:
+                message = session.prompt("You: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                message = "/quit"
+
+            stop_typing(client)
 
             if message.lower() == "/quit":
                 send_event(client, {
@@ -154,6 +238,7 @@ def start_client():
         print(f"Connection error: {error}")
     finally:
         stop_event.set()
+        stop_typing(client)
 
         try:
             client.shutdown(socket.SHUT_RDWR)
