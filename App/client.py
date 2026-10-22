@@ -1,22 +1,73 @@
 
+import json
 import socket
 import threading
+import uuid
 
 HOST = "127.0.0.1"
 PORT = 5000
 
+pending_status = {}
+status_lock = threading.Lock()
 
-def receive_messages(reader, stop_event):
+
+def send_event(client, event):
+    data = json.dumps(event) + "\n"
+    client.sendall(data.encode("utf-8"))
+
+
+def receive_messages(reader, client, stop_event):
     try:
         while not stop_event.is_set():
-            message = reader.readline()
+            line = reader.readline()
 
-            if not message:
+            if not line:
                 if not stop_event.is_set():
                     print("\nDisconnected from the server.")
                 break
 
-            print(f"\n{message.strip()}")
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"\n{line.strip()}")
+                continue
+
+            event_type = event.get("type")
+
+            if event_type == "text":
+                print(f"\n{event.get('message', '')}")
+
+            elif event_type == "private_message":
+                message_id = event.get("message_id")
+                sender = event.get("sender", "Unknown")
+                message = event.get("message", "")
+
+                print(f"\n[Private] {sender}: {message}")
+
+                send_event(client, {
+                    "type": "delivered",
+                    "message_id": message_id
+                })
+
+            elif event_type == "status":
+                message_id = event.get("message_id")
+                status = event.get("status", "unknown")
+
+                with status_lock:
+                    pending_status[message_id] = status
+
+                if status == "sent":
+                    print(f"\nMessage {message_id[:8]}: Sent ✓")
+                elif status == "delivered":
+                    print(f"\nMessage {message_id[:8]}: Delivered ✓✓")
+                elif status == "failed":
+                    print(
+                        f"\nMessage {message_id[:8]}: Failed — "
+                        f"{event.get('message', 'Delivery failed')}"
+                    )
+
+            else:
+                print(f"\nUnknown server event: {event}")
 
     except (OSError, ValueError):
         pass
@@ -32,7 +83,8 @@ def start_client():
         reader = client.makefile("r", encoding="utf-8")
 
         print("Connected to the chat server.")
-        print(reader.readline().strip())
+        initial_response = json.loads(reader.readline())
+        print(initial_response.get("message", initial_response))
 
         username = input("Username: ").strip()
 
@@ -42,15 +94,20 @@ def start_client():
 
         client.sendall((username + "\n").encode("utf-8"))
 
-        response = reader.readline().strip()
-        print(response)
+        response_line = reader.readline()
+        if not response_line:
+            print("The server closed the connection.")
+            return
 
-        if response.startswith("ERROR:") or not response:
+        response = json.loads(response_line)
+        print(response.get("message", response))
+
+        if response.get("message", "").startswith("ERROR:"):
             return
 
         receiver = threading.Thread(
             target=receive_messages,
-            args=(reader, stop_event),
+            args=(reader, client, stop_event),
             daemon=True
         )
         receiver.start()
@@ -65,17 +122,36 @@ def start_client():
             message = input("You: ").strip()
 
             if message.lower() == "/quit":
+                send_event(client, {
+                    "type": "command",
+                    "message": "/quit"
+                })
                 break
 
-            if message:
-                client.sendall((message + "\n").encode("utf-8"))
+            if message in ("/contacts", "/back") or message.startswith("/chat "):
+                send_event(client, {
+                    "type": "command",
+                    "message": message
+                })
+
+            elif message:
+                message_id = str(uuid.uuid4())
+
+                with status_lock:
+                    pending_status[message_id] = "sending"
+
+                print(f"Message {message_id[:8]}: Sending…")
+
+                send_event(client, {
+                    "type": "chat",
+                    "message_id": message_id,
+                    "message": message
+                })
 
     except ConnectionRefusedError:
         print("Could not connect. Start the server first.")
-
-    except (ConnectionResetError, OSError) as error:
+    except (ConnectionResetError, OSError, ValueError) as error:
         print(f"Connection error: {error}")
-
     finally:
         stop_event.set()
 
