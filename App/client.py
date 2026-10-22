@@ -6,35 +6,33 @@ HOST = "127.0.0.1"
 PORT = 5000
 
 
-def receive_messages(client):
-    reader = client.makefile("r", encoding="utf-8")
-
+def receive_messages(reader, stop_event):
     try:
-        while True:
+        while not stop_event.is_set():
             message = reader.readline()
 
             if not message:
-                print("\nDisconnected from the server.")
+                if not stop_event.is_set():
+                    print("\nDisconnected from the server.")
                 break
 
             print(f"\n{message.strip()}")
-            print("You: ", end="", flush=True)
-    except OSError:
+
+    except (OSError, ValueError):
         pass
-    finally:
-        reader.close()
 
 
 def start_client():
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    reader = None
+    stop_event = threading.Event()
 
     try:
         client.connect((HOST, PORT))
-        print("Connected to the chat server.")
-
         reader = client.makefile("r", encoding="utf-8")
-        prompt = reader.readline()
-        print(prompt.strip())
+
+        print("Connected to the chat server.")
+        print(reader.readline().strip())
 
         username = input("Username: ").strip()
 
@@ -47,20 +45,21 @@ def start_client():
         response = reader.readline().strip()
         print(response)
 
-        if response.startswith("ERROR:"):
+        if response.startswith("ERROR:") or not response:
             return
 
         receiver = threading.Thread(
             target=receive_messages,
-            args=(client,),
+            args=(reader, stop_event),
             daemon=True
         )
         receiver.start()
 
         print("\nCommands:")
-        print("  /contacts       - View online users")
-        print("  /chat username  - Initiate a private chat")
-        print("  /quit           - Disconnect")
+        print("/contacts - View online users")
+        print("/chat username - Start a private chat")
+        print("/back - Leave the private chat")
+        print("/quit - Disconnect")
 
         while True:
             message = input("You: ").strip()
@@ -73,10 +72,26 @@ def start_client():
 
     except ConnectionRefusedError:
         print("Could not connect. Start the server first.")
+
     except (ConnectionResetError, OSError) as error:
         print(f"Connection error: {error}")
+
     finally:
+        stop_event.set()
+
+        try:
+            client.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
         client.close()
+
+        if reader is not None:
+            try:
+                reader.close()
+            except OSError:
+                pass
+
         print("Disconnected from the chat server.")
 
 
