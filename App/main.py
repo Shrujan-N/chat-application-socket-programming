@@ -48,7 +48,18 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
             if data.get("type") == "send_message":
                 recipient = data.get("recipient")
                 content = data.get("content")
-                print(f"Message from {username} to {recipient}: {content}")
+                
+                incoming_frame = {
+                    "type": "receive_message",
+                    "sender": username,
+                    "recipient": recipient,
+                    "content": content,
+                    "timestamp": data.get("timestamp")
+                }
+                
+                # Targeted real-time delivery to online recipient (ADDED FOR ISSUE #20)
+                if recipient in manager.active_connections:
+                    await manager.active_connections[recipient].send_json(incoming_frame)
     except WebSocketDisconnect:
         manager.disconnect(username)
 
@@ -66,6 +77,16 @@ class RespondRequestSchema(BaseModel):
 class RemoveContactSchema(BaseModel):
     user_id: str
     contact_username: str
+
+# --- Fetch All Users Endpoint for Account Switcher (ADDED FOR EASY SWITCHING) ---
+@app.get("/api/users")
+async def get_all_users():
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT username FROM users")
+    rows = cursor.fetchall()
+    conn.close()
+    return {"users": [row["username"] for row in rows]}
 
 @app.get("/api/contacts/{username}")
 async def get_contacts(username: str):
