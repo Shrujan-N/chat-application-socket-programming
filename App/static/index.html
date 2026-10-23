@@ -58,13 +58,39 @@
                 handleIncomingSignal(data);
             };
         }
-        function handleIncomingSignal(data) {}
+function handleIncomingSignal(data) {}
         function handleSearch() {}
         function sendMessage() {}
         function uploadFile() {}
         
+        // --- Contact Management JS (ADDED FOR ISSUE #17) ---
+        async function loadContacts() {
+            const response = await fetch(`/api/contacts/${currentUser}`);
+            const data = await response.json();
+            const listElement = document.getElementById('contacts-list');
+            listElement.innerHTML = '';
+            
+            data.contacts.forEach(contact => {
+                const item = document.createElement('div');
+                item.className = `contact-item ${activeContact === contact ? 'active' : ''}`;
+                item.innerText = `👤 ${contact}`;
+                item.onclick = () => selectContact(contact);
+                listElement.appendChild(item);
+            });
+        }
+
+        function selectContact(contact) {
+            activeContact = contact;
+            document.getElementById('chat-header').innerText = `Chatting with: ${contact}`;
+            loadContacts();
+            if (typeof loadHistory === "function") {
+                loadHistory();
+            }
+        }
+
         window.onload = function() {
             initWebSocket();
+            loadContacts();
         };
     </script>
 </body>
