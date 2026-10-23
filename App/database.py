@@ -14,11 +14,25 @@ def init_db():
     
     # Core User Table
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
+    CREATE TABLE IF NOT EXISTS contacts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL
+        user_id TEXT NOT NULL,
+        contact_id TEXT NOT NULL,
+        status TEXT DEFAULT 'accepted',
+        UNIQUE(user_id, contact_id)
+    );
+    """)
+
+    # Message Persistence Table (ADDED FOR ISSUE #23)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        msg_id TEXT UNIQUE NOT NULL,
+        sender TEXT NOT NULL,
+        recipient TEXT NOT NULL,
+        content TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        status TEXT DEFAULT 'sent'
     );
     """)
     
