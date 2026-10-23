@@ -9,8 +9,12 @@ PORT = 5000
 
 clients = {}
 active_chats = {}
+active_groups = {}
+groups = {}
+user_groups = {}
 pending_messages = {}
-clients_lock = threading.Lock()
+offline_messages = {}
+clients_lock = threading.RLock()
 
 
 def send_event(connection, event):
@@ -23,7 +27,364 @@ def send_event(connection, event):
 
 
 def send_text(connection, message):
-    return send_event(connection, {"type": "text", "message": message})
+    return send_event(
+        connection,
+        {"type": "text", "message": message}
+    )
+
+
+def send_status(username, message_id, status, message=None):
+    event = {
+        "type": "status",
+        "message_id": message_id,
+        "status": status
+    }
+
+    if message:
+        event["message"] = message
+
+    with clients_lock:
+        connection = clients.get(username)
+
+    if connection:
+        send_event(connection, event)
+
+
+def queue_message(username, event):
+    with clients_lock:
+        queue = offline_messages.setdefault(username, [])
+
+        if not any(
+            item.get("message_id") == event.get("message_id")
+            and item.get("type") == event.get("type")
+            for item in queue
+        ):
+            queue.append(event)
+
+
+def remove_queued_message(username, message_id):
+    with clients_lock:
+        queue = offline_messages.get(username, [])
+
+        offline_messages[username] = [
+            event for event in queue
+            if event.get("message_id") != message_id
+        ]
+
+
+def handle_chat(username, event):
+    message = event.get("message", "").strip()
+
+    if not message:
+        return
+
+    message_id = event.get("message_id") or str(uuid.uuid4())
+
+    with clients_lock:
+        sender_connection = clients.get(username)
+
+        group_key = active_groups.get(username)
+        group = groups.get(group_key) if group_key else None
+
+        if group:
+            recipients = set(group["members"]) - {username}
+            message_event = {
+                "type": "group_message",
+                "message_id": message_id,
+                "group": group["name"],
+                "sender": username,
+                "message": message
+            }
+        else:
+            target = active_chats.get(username)
+
+            if not target:
+                send_event(sender_connection, {
+                    "type": "status",
+                    "message_id": message_id,
+                    "status": "failed",
+                    "message": "Select a private chat or group first."
+                })
+                return
+
+            recipients = {target}
+            message_event = {
+                "type": "private_message",
+                "message_id": message_id,
+                "sender": username,
+                "message": message
+            }
+
+        if not recipients:
+            send_event(sender_connection, {
+                "type": "status",
+                "message_id": message_id,
+                "status": "failed",
+                "message": "There are no other members in this chat."
+            })
+            return
+
+        pending_messages[message_id] = {
+            "sender": username,
+            "recipients": set(recipients)
+        }
+
+        for recipient in recipients:
+            queue = offline_messages.setdefault(recipient, [])
+
+            if not any(
+                item.get("message_id") == message_id
+                for item in queue
+            ):
+                queue.append(message_event)
+
+            recipient_connection = clients.get(recipient)
+
+            if recipient_connection:
+                send_event(recipient_connection, message_event)
+
+    send_status(username, message_id, "sent")
+
+
+def handle_delivery(username, message_id):
+    if not message_id:
+        return
+
+    remove_queued_message(username, message_id)
+
+    with clients_lock:
+        pending = pending_messages.get(message_id)
+
+        if not pending or username not in pending["recipients"]:
+            return
+
+        pending["recipients"].discard(username)
+        sender = pending["sender"]
+
+        if pending["recipients"]:
+            return
+
+        pending_messages.pop(message_id, None)
+
+    send_status(sender, message_id, "delivered")
+
+
+def handle_command(connection, username, command):
+    if command == "/contacts":
+        with clients_lock:
+            online_users = [
+                name for name in clients if name != username
+            ]
+
+        send_text(
+            connection,
+            "Online users: " + ", ".join(online_users)
+            if online_users else "No other users are online."
+        )
+        return
+
+    if command.startswith("/group-create "):
+        parts = command.split(maxsplit=2)
+
+        if len(parts) < 3:
+            send_text(
+                connection,
+                "Usage: /group-create groupname username1,username2"
+            )
+            return
+
+        group_name = parts[1].strip()
+        requested_members = [
+            name.strip()
+            for name in parts[2].split(",")
+            if name.strip()
+        ]
+        group_key = group_name.casefold()
+
+        if not group_name or not requested_members:
+            send_text(
+                connection,
+                "Provide a group name and at least one member."
+            )
+            return
+
+        if len(set(requested_members)) != len(requested_members):
+            send_text(
+                connection,
+                "The member list contains duplicate usernames."
+            )
+            return
+
+        if username in requested_members:
+            send_text(
+                connection,
+                "Do not include your own username; you are added automatically."
+            )
+            return
+
+        with clients_lock:
+            if group_key in groups:
+                send_text(connection, "That group name already exists.")
+                return
+
+            offline_members = [
+                name for name in requested_members
+                if name not in clients
+            ]
+
+            if offline_members:
+                send_text(
+                    connection,
+                    "These users are not online: "
+                    + ", ".join(offline_members)
+                )
+                return
+
+            members = set(requested_members)
+            members.add(username)
+
+            groups[group_key] = {
+                "name": group_name,
+                "creator": username,
+                "members": members
+            }
+
+            for member in members:
+                user_groups.setdefault(member, set()).add(group_key)
+
+            member_connections = {
+                member: clients.get(member)
+                for member in members
+                if member != username
+            }
+
+        send_text(
+            connection,
+            f"Group '{group_name}' created with {len(members)} members. "
+            f"Use /group {group_name} to chat."
+        )
+
+        for member, member_connection in member_connections.items():
+            if member_connection:
+                send_text(
+                    member_connection,
+                    f"You were added to group '{group_name}' by {username}."
+                )
+        return
+
+    if command == "/groups":
+        with clients_lock:
+            names = [
+                groups[key]["name"]
+                for key in user_groups.get(username, set())
+                if key in groups
+            ]
+
+        send_text(
+            connection,
+            "Your groups: " + ", ".join(names)
+            if names else "You are not in any groups."
+        )
+        return
+
+    if command.startswith("/group "):
+        group_name = command[len("/group "):].strip()
+        group_key = group_name.casefold()
+
+        with clients_lock:
+            group = groups.get(group_key)
+            is_member = bool(
+                group and username in group["members"]
+            )
+
+            if is_member:
+                active_groups[username] = group_key
+
+                target = active_chats.pop(username, None)
+                if target and active_chats.get(target) == username:
+                    active_chats.pop(target, None)
+
+        if not is_member:
+            send_text(
+                connection,
+                f"You are not a member of group '{group_name}'."
+            )
+        else:
+            send_text(
+                connection,
+                f"Switched to group chat '{group['name']}'."
+            )
+        return
+
+    if command.startswith("/chat "):
+        target = command[len("/chat "):].strip()
+
+        if not target or target == username:
+            send_text(connection, "Enter another user's username.")
+            return
+
+        with clients_lock:
+            active_groups.pop(username, None)
+
+            previous_target = active_chats.get(username)
+            if (
+                previous_target
+                and active_chats.get(previous_target) == username
+            ):
+                active_chats.pop(previous_target, None)
+
+            active_chats[username] = target
+            active_chats[target] = username
+            target_connection = clients.get(target)
+
+        send_text(
+            connection,
+            f"Private chat selected with {target}. "
+            "Messages will be delivered when they reconnect."
+        )
+
+        if target_connection:
+            send_text(
+                target_connection,
+                f"Private chat started with {username}. "
+                "You can now reply directly."
+            )
+        return
+
+    if command == "/back":
+        with clients_lock:
+            group_key = active_groups.pop(username, None)
+
+            if group_key:
+                group = groups.get(group_key)
+                group_name = group["name"] if group else group_key
+                send_text(
+                    connection,
+                    f"You left the active group chat '{group_name}'."
+                )
+                return
+
+            target = active_chats.pop(username, None)
+
+            if target and active_chats.get(target) == username:
+                active_chats.pop(target, None)
+                target_connection = clients.get(target)
+            else:
+                target_connection = None
+
+        send_text(connection, "You left the private chat.")
+
+        if target_connection:
+            send_text(
+                target_connection,
+                f"{username} left the private chat."
+            )
+        return
+
+    if command == "/quit":
+        raise ConnectionAbortedError
+
+    send_text(connection, "Unknown command.")
 
 
 def handle_client(connection, address):
@@ -37,6 +398,7 @@ def handle_client(connection, address):
         send_text(connection, "Enter your username:")
 
         username = reader.readline().strip()
+
         if not username:
             return
 
@@ -44,13 +406,28 @@ def handle_client(connection, address):
             if username in clients:
                 send_text(connection, "ERROR: Username already in use.")
                 return
+
             clients[username] = connection
+            user_groups.setdefault(username, set())
+            offline_messages.setdefault(username, [])
 
         send_text(connection, f"Welcome, {username}!")
         print(f"{username} is now online.")
 
+        with clients_lock:
+            queued = list(offline_messages.get(username, []))
+
+        for event in queued:
+            with clients_lock:
+                if clients.get(username) is not connection:
+                    break
+
+            if not send_event(connection, event):
+                break
+
         while True:
             line = reader.readline()
+
             if not line:
                 break
 
@@ -63,136 +440,33 @@ def handle_client(connection, address):
             event_type = event.get("type")
 
             if event_type == "chat":
-                message = event.get("message", "").strip()
-                if not message:
-                    continue
-
-                with clients_lock:
-                    target = active_chats.get(username)
-                    target_connection = clients.get(target) if target else None
-
-                if not target or not target_connection:
-                    send_event(connection, {
-                        "type": "status",
-                        "message_id": event.get("message_id"),
-                        "status": "failed",
-                        "message": "No active private chat."
-                    })
-                    continue
-
-                message_id = event.get("message_id") or str(uuid.uuid4())
-
-                with clients_lock:
-                    pending_messages[message_id] = {
-                        "sender": username,
-                        "recipient": target
-                    }
-
-                delivered_to_socket = send_event(target_connection, {
-                    "type": "private_message",
-                    "message_id": message_id,
-                    "sender": username,
-                    "message": message
-                })
-
-                if delivered_to_socket:
-                    send_event(connection, {
-                        "type": "status",
-                        "message_id": message_id,
-                        "status": "sent"
-                    })
-                else:
-                    with clients_lock:
-                        pending_messages.pop(message_id, None)
-
-                    send_event(connection, {
-                        "type": "status",
-                        "message_id": message_id,
-                        "status": "failed",
-                        "message": "Could not send the message."
-                    })
+                handle_chat(username, event)
 
             elif event_type == "delivered":
-                message_id = event.get("message_id")
+                handle_delivery(username, event.get("message_id"))
 
+            elif event_type in ("typing", "stop_typing"):
                 with clients_lock:
-                    pending = pending_messages.get(message_id)
+                    target = active_chats.get(username)
+                    target_connection = (
+                        clients.get(target) if target else None
+                    )
 
-                    if pending and pending["recipient"] == username:
-                        sender_connection = clients.get(pending["sender"])
-                        pending_messages.pop(message_id, None)
-                    else:
-                        sender_connection = None
-
-                if sender_connection:
-                    send_event(sender_connection, {
-                        "type": "status",
-                        "message_id": message_id,
-                        "status": "delivered"
+                if target_connection:
+                    send_event(target_connection, {
+                        "type": event_type,
+                        "username": username
                     })
 
             elif event_type == "command":
-                command = event.get("message", "").strip()
-
-                if command == "/contacts":
-                    with clients_lock:
-                        online_users = [
-                            name for name in clients if name != username
-                        ]
-
-                    send_text(
+                try:
+                    handle_command(
                         connection,
-                        "Online users: " + ", ".join(online_users)
-                        if online_users else "No other users are online."
+                        username,
+                        event.get("message", "").strip()
                     )
-
-                elif command.startswith("/chat "):
-                    target = command[len("/chat "):].strip()
-
-                    if target == username:
-                        send_text(connection, "You cannot chat with yourself.")
-                        continue
-
-                    with clients_lock:
-                        target_connection = clients.get(target)
-
-                        if target_connection:
-                            active_chats[username] = target
-                            active_chats[target] = username
-
-                    if not target_connection:
-                        send_text(connection, f"{target} is not online.")
-                    else:
-                        send_text(connection, f"Private chat started with {target}.")
-                        send_text(
-                            target_connection,
-                            f"Private chat started with {username}. "
-                            "You can now reply directly."
-                        )
-
-                elif command == "/back":
-                    with clients_lock:
-                        target = active_chats.pop(username, None)
-                        if target and active_chats.get(target) == username:
-                            active_chats.pop(target, None)
-
-                    send_text(connection, "You left the private chat.")
-
-                    if target:
-                        with clients_lock:
-                            target_connection = clients.get(target)
-
-                        if target_connection:
-                            send_text(
-                                target_connection,
-                                f"{username} left the private chat."
-                            )
-
-                elif command == "/quit":
+                except ConnectionAbortedError:
                     break
-
-                else:
-                    send_text(connection, "Unknown command.")
 
     except (ConnectionResetError, OSError, ValueError) as error:
         print(f"Connection error for {username or address}: {error}")
@@ -204,12 +478,11 @@ def handle_client(connection, address):
 
             if username:
                 target = active_chats.pop(username, None)
+
                 if target and active_chats.get(target) == username:
                     active_chats.pop(target, None)
 
-            for message_id, pending in list(pending_messages.items()):
-                if username in (pending["sender"], pending["recipient"]):
-                    del pending_messages[message_id]
+                active_groups.pop(username, None)
 
         if reader is not None:
             try:
@@ -217,7 +490,11 @@ def handle_client(connection, address):
             except OSError:
                 pass
 
-        connection.close()
+        try:
+            connection.close()
+        except OSError:
+            pass
+
         print(f"Disconnected: {address}")
 
 
