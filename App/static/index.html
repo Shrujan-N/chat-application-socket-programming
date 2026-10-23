@@ -29,7 +29,11 @@
 <body>
     <div id="sidebar">
         <div class="header">
-            <span>User: <strong id="current-username">shrujan</strong></span>
+            <div style="display:flex; align-items:center; gap:5px;">
+                <span style="font-size:13px;">User:</span>
+                <select id="user-select" onchange="switchAccount(this.value)" style="padding:4px 8px; background:#0f141d; color:#fff; border:1px solid #2e3b52; border-radius:4px; outline:none; font-weight:bold; cursor:pointer;">
+                </select>
+            </div>
             <button onclick="addContactPrompt()" style="padding: 5px 10px; font-size: 12px; background: #28a745;">+ Add</button>
         </div>
         <div class="search-box">
@@ -62,8 +66,36 @@
         }
 
         // --- Contact Management JS Functions ---
+        async function loadUsersDropdown() {
+            const response = await fetch('/api/users');
+            const data = await response.json();
+            const select = document.getElementById('user-select');
+            select.innerHTML = '';
+            
+            data.users.forEach(username => {
+                const opt = document.createElement('option');
+                opt.value = username;
+                opt.innerText = username;
+                if (username === currentUser) opt.selected = true;
+                select.appendChild(opt);
+            });
+        }
+
+        function switchAccount(newUsername) {
+            if (!newUsername || newUsername === currentUser) return;
+            currentUser = newUsername;
+            activeContact = null;
+            
+            document.getElementById('chat-header').innerText = 'Select a contact to begin messaging';
+            document.getElementById('messages-list').innerHTML = '';
+            
+            if (ws) ws.close();
+            initWebSocket();
+            loadContacts();
+        }
+
         async function addContactPrompt() {
-            const contactName = prompt("Enter username of contact to add (e.g. testuser01, testuser02):");
+            const contactName = prompt("Enter username of contact to add:");
             if (!contactName || !contactName.trim()) return;
 
             const response = await fetch('/api/contacts/add', {
@@ -78,6 +110,7 @@
 
             if (data.success) {
                 alert(`Success: ${data.message}`);
+                loadUsersDropdown(); // Refresh dropdown so newly added user appears!
                 loadContacts();
             } else {
                 alert(`Error: ${data.error || "Failed to add contact"}`);
@@ -167,7 +200,16 @@
             loadContacts();
         }
 
-        function handleIncomingSignal(data) {}
+        // --- Receive Text Message Event Handler (ADDED FOR ISSUE #20) ---
+        function handleIncomingSignal(data) {
+            if (data.type === "receive_message") {
+                if (activeContact === data.sender) {
+                    appendMessageUI(data.sender, data.content, data.timestamp, 'delivered', data.msg_id || Date.now());
+                } else {
+                    alert(`New message from ${data.sender}!`);
+                }
+            }
+        }
         function handleSearch() {}
 
         function sendMessage() {
@@ -209,6 +251,7 @@
         function uploadFile() {}
 
         window.onload = function() {
+            loadUsersDropdown();
             initWebSocket();
             loadContacts();
         };
