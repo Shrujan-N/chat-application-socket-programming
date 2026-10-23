@@ -60,7 +60,42 @@
         }
         function handleIncomingSignal(data) {}
         function handleSearch() {}
-        function sendMessage() {}
+// --- Send Message Handler (ADDED FOR ISSUE #19) ---
+        function sendMessage() {
+            const input = document.getElementById('message-input');
+            const content = input.value.trim();
+            
+            if (!content || !activeContact) {
+                if(!activeContact) alert("Please select a contact first!");
+                return;
+            }
+
+            const payload = {
+                type: "send_message",
+                sender: currentUser,
+                recipient: activeContact,
+                content: content,
+                timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+            };
+
+            ws.send(JSON.stringify(payload));
+            appendMessageUI(currentUser, content, payload.timestamp, 'sending', 'temp-' + Date.now());
+            input.value = '';
+        }
+
+        function appendMessageUI(sender, content, timeStr, status, msgId) {
+            const list = document.getElementById('messages-list');
+            const msgDiv = document.createElement('div');
+            const isSent = (sender === currentUser);
+            msgDiv.className = `message ${isSent ? 'sent' : 'received'}`;
+            msgDiv.id = `msg-${msgId}`;
+            
+            let statusHTML = isSent ? `<span class="message-status" id="status-${msgId}">✓</span>` : '';
+            msgDiv.innerHTML = `<div>${content}</div><div style="font-size:10px; opacity:0.7; text-align:right;">${timeStr} ${statusHTML}</div>`;
+            
+            list.appendChild(msgDiv);
+            list.scrollTop = list.scrollHeight;
+        }
         function uploadFile() {}
         
         window.onload = function() {
