@@ -1,4 +1,7 @@
 
+import re
+import bcrypt
+from db import get_connection
 import json
 import socket
 import threading
@@ -26,27 +29,216 @@ def send_text(connection, message):
     return send_event(connection, {"type": "text", "message": message})
 
 
+def validate_registration(email, username, password):
+    email = email.strip()
+    username = username.strip()
+
+    if not email or not username or not password:
+        return False, "All fields are required."
+
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        return False, "Please enter a valid email address."
+
+    if len(username) < 3 or len(username) > 50:
+        return False, "Username must be 3–50 characters long."
+
+    # Password policy: at least 8 characters, one uppercase,
+    # one lowercase, one digit and one special character.
+    if (
+        len(password) < 8
+        or not re.search(r"[A-Z]", password)
+        or not re.search(r"[a-z]", password)
+        or not re.search(r"\d", password)
+        or not re.search(r"[^A-Za-z0-9]", password)
+    ):
+        return False, (
+            "Password must be at least 8 characters and include "
+            "uppercase, lowercase, a number and a special character."
+        )
+
+    return True, "Registration details are valid."
+
+
+def register_user(email, username, password):
+    valid, message = validate_registration(email, username, password)
+
+    if not valid:
+        return False, message
+
+    password_hash = bcrypt.hashpw(
+        password.encode("utf-8"),
+        bcrypt.gensalt()
+    ).decode("utf-8")
+
+    connection = None
+
+    try:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO users (email, username, password_hash)
+            VALUES (%s, %s, %s)
+            """,
+            (email.strip(), username.strip(), password_hash)
+        )
+
+        connection.commit()
+        return True, "Account created successfully! You can now log in."
+
+    except Exception as error:
+        if connection:
+            connection.rollback()
+
+        # MySQL duplicate-key error.
+        if getattr(error, "errno", None) == 1062:
+            return False, "Email or username is already registered."
+
+        print("Registration database error:", error)
+        return False, "Registration failed due to a server error."
+
+    finally:
+        if connection:
+            connection.close()
+
+
+def login_user(username, password):
+    connection = None
+
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        cursor.execute(
+            """
+            SELECT username, password_hash
+            FROM users
+            WHERE username = %s
+            """,
+            (username.strip(),)
+        )
+
+        user = cursor.fetchone()
+
+        if not user:
+            return False, "Invalid username or password."
+
+        password_matches = bcrypt.checkpw(
+            password.encode("utf-8"),
+            user["password_hash"].encode("utf-8")
+        )
+
+        if not password_matches:
+            return False, "Invalid username or password."
+
+        return True, "Login successful!"
+
+    except Exception as error:
+        print("Login database error:", error)
+        return False, "Login failed due to a server error."
+
+    finally:
+        if connection:
+            connection.close()
+
+
+
+
 def handle_client(connection, address):
     username = None
     reader = None
 
     print(f"Connection received: {address}")
 
-    try:
+    try:        
         reader = connection.makefile("r", encoding="utf-8")
-        send_text(connection, "Enter your username:")
 
-        username = reader.readline().strip()
-        if not username:
+        # Receive the registration or login request
+        auth_line = reader.readline()
+
+        if not auth_line:
             return
 
+        try:
+            auth_event = json.loads(auth_line)
+        except json.JSONDecodeError:
+            send_event(connection, {
+                "type": "auth_result",
+                "success": False,
+                "message": "Invalid authentication request."
+            })
+            return
+
+        auth_type = auth_event.get("type")
+
+        # Handle registration
+        if auth_type == "register":
+            success, message = register_user(
+                auth_event.get("email", ""),
+                auth_event.get("username", ""),
+                auth_event.get("password", "")
+            )
+
+            send_event(connection, {
+                "type": "auth_result",
+                "success": success,
+                "message": message
+            })
+            return
+
+        # Handle login
+        if auth_type != "login":
+            send_event(connection, {
+                "type": "auth_result",
+                "success": False,
+                "message": "Please choose Register or Login."
+            })
+            return
+
+        username = auth_event.get("username", "").strip()
+        password = auth_event.get("password", "")
+
+        if not username or not password:
+            send_event(connection, {
+                "type": "auth_result",
+                "success": False,
+                "message": "Username and password are required."
+            })
+            return
+
+        success, message = login_user(username, password)
+
+        if not success:
+            send_event(connection, {
+                "type": "auth_result",
+                "success": False,
+                "message": message
+            })
+            return
+
+        # Prevent two connections using the same online username
         with clients_lock:
             if username in clients:
-                send_text(connection, "ERROR: Username already in use.")
-                return
-            clients[username] = connection
+                already_online = True
+            else:
+                clients[username] = connection
+                already_online = False
 
-        send_text(connection, f"Welcome, {username}!")
+        if already_online:
+            send_event(connection, {
+                "type": "auth_result",
+                "success": False,
+                "message": "This user is already online."
+            })
+            return
+
+        send_event(connection, {
+            "type": "auth_result",
+            "success": True,
+            "message": f"Welcome, {username}!"
+        })
+
         print(f"{username} is now online.")
 
         while True:

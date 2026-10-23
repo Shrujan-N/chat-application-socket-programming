@@ -73,6 +73,60 @@ def receive_messages(reader, client, stop_event):
         pass
 
 
+def authenticate(client, reader):
+    print("\n=== Chat Application ===")
+    print("1. Register")
+    print("2. Login")
+
+    choice = input("Choose an option (1 or 2): ").strip()
+
+    if choice == "1":
+        email = input("Email: ").strip()
+        username = input("Choose a username: ").strip()
+        password = input("Choose a password: ")
+
+        event = {
+            "type": "register",
+            "email": email,
+            "username": username,
+            "password": password
+        }
+
+    elif choice == "2":
+        username = input("Username: ").strip()
+        password = input("Password: ")
+
+        event = {
+            "type": "login",
+            "username": username,
+            "password": password
+        }
+
+    else:
+        print("Invalid option. Please choose 1 or 2.")
+        return None
+
+    send_event(client, event)
+
+    response_line = reader.readline()
+
+    if not response_line:
+        print("The server closed the connection.")
+        return None
+
+    response = json.loads(response_line)
+    print(response.get("message", "No response from server."))
+
+    if not response.get("success", False):
+        return None
+
+    if event["type"] == "register":
+        print("Please log in using your new account.")
+        return None
+
+    return username
+
+
 def start_client():
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     reader = None
@@ -83,26 +137,10 @@ def start_client():
         reader = client.makefile("r", encoding="utf-8")
 
         print("Connected to the chat server.")
-        initial_response = json.loads(reader.readline())
-        print(initial_response.get("message", initial_response))
 
-        username = input("Username: ").strip()
+        username = authenticate(client, reader)
 
-        if not username:
-            print("Username cannot be empty.")
-            return
-
-        client.sendall((username + "\n").encode("utf-8"))
-
-        response_line = reader.readline()
-        if not response_line:
-            print("The server closed the connection.")
-            return
-
-        response = json.loads(response_line)
-        print(response.get("message", response))
-
-        if response.get("message", "").startswith("ERROR:"):
+        if username is None:
             return
 
         receiver = threading.Thread(
@@ -128,7 +166,10 @@ def start_client():
                 })
                 break
 
-            if message in ("/contacts", "/back") or message.startswith("/chat "):
+            if (
+                message in ("/contacts", "/back")
+                or message.startswith("/chat ")
+            ):
                 send_event(client, {
                     "type": "command",
                     "message": message
@@ -150,8 +191,10 @@ def start_client():
 
     except ConnectionRefusedError:
         print("Could not connect. Start the server first.")
+
     except (ConnectionResetError, OSError, ValueError) as error:
         print(f"Connection error: {error}")
+
     finally:
         stop_event.set()
 
