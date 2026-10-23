@@ -1,4 +1,3 @@
-
 import json
 import socket
 import threading
@@ -34,7 +33,6 @@ def stop_typing(client):
 
         if is_typing:
             is_typing = False
-
             try:
                 send_event(client, {"type": "stop_typing"})
             except OSError:
@@ -49,7 +47,6 @@ def typing_timeout(client):
 
         if is_typing:
             is_typing = False
-
             try:
                 send_event(client, {"type": "stop_typing"})
             except OSError:
@@ -69,7 +66,6 @@ def handle_text_change(buffer, client):
         if not current_text or current_text.startswith("/"):
             if is_typing:
                 is_typing = False
-
                 try:
                     send_event(client, {"type": "stop_typing"})
                 except OSError:
@@ -78,7 +74,6 @@ def handle_text_change(buffer, client):
 
         if not is_typing:
             is_typing = True
-
             try:
                 send_event(client, {"type": "typing"})
             except OSError:
@@ -122,8 +117,10 @@ def receive_messages(reader, client, stop_event):
 
                 if event_type == "group_message":
                     group_name = event.get("group", "Unknown")
+                    icon = event.get("icon", "👥")
                     print(
-                        f"\n[Group: {group_name}] {sender}: {message}"
+                        f"\n[{icon} Group: {group_name}] "
+                        f"{sender}: {message}"
                     )
                 else:
                     print(f"\n[Private] {sender}: {message}")
@@ -161,10 +158,8 @@ def receive_messages(reader, client, stop_event):
 
                 if status == "sent":
                     print(f"\nMessage {short_id}: Sent ✓")
-
                 elif status == "delivered":
                     print(f"\nMessage {short_id}: Delivered ✓✓")
-
                 elif status == "failed":
                     print(
                         f"\nMessage {short_id}: Failed — "
@@ -176,6 +171,53 @@ def receive_messages(reader, client, stop_event):
 
     except (OSError, ValueError):
         pass
+
+
+def is_command(message):
+    exact_commands = {
+        "/contacts",
+        "/back",
+        "/groups",
+        "/quit",
+        "/help",
+        "/group-help"
+    }
+
+    prefixes = (
+        "/chat ",
+        "/group ",
+        "/group-create ",
+        "/group-info ",
+        "/group-add ",
+        "/group-remove ",
+        "/group-rename ",
+        "/group-icon ",
+        "/group-admin ",
+        "/group-admin-remove "
+    )
+
+    return message in exact_commands or message.startswith(prefixes)
+
+
+def print_help():
+    print("\n--- Chat Commands ---")
+    print("/contacts                         View online users")
+    print("/chat username                    Start a private chat")
+    print("/group-create name user1,user2    Create a group")
+    print("/groups                           List your groups")
+    print("/group name                       Enter a group")
+    print("/back                             Leave the active chat")
+    print("/quit                             Disconnect")
+
+    print("\n--- Group Management ---")
+    print("/group-info name                  View group details")
+    print("/group-add name username          Add a member")
+    print("/group-remove name username       Remove a member")
+    print("/group-rename oldname newname     Rename a group")
+    print("/group-icon name emoji            Change group icon")
+    print("/group-admin name username        Make a member an admin")
+    print("/group-admin-remove name username Remove an admin role")
+    print("/group-help                       Show group management help")
 
 
 def start_client():
@@ -234,14 +276,7 @@ def start_client():
         )
         receiver.start()
 
-        print("\nCommands:")
-        print("/contacts - View online users")
-        print("/chat username - Select a private chat")
-        print("/group-create name user1,user2 - Create a group")
-        print("/groups - View your groups")
-        print("/group name - Enter a group chat")
-        print("/back - Leave the active chat")
-        print("/quit - Disconnect")
+        print_help()
         print(
             "\nOffline messages are queued in server memory "
             "until acknowledged."
@@ -265,17 +300,19 @@ def start_client():
                     pass
                 break
 
-            if (
-                message in ("/contacts", "/back", "/groups")
-                or message.startswith("/chat ")
-                or message.startswith("/group ")
-                or message.startswith("/group-create ")
-            ):
-                send_event(client, {
-                    "type": "command",
-                    "message": message
-                })
+            if message == "/help":
+                print_help()
+                continue
 
+            if is_command(message):
+                try:
+                    send_event(client, {
+                        "type": "command",
+                        "message": message
+                    })
+                except OSError:
+                    print("Could not send command.")
+                    break
             elif message:
                 message_id = str(uuid.uuid4())
 
@@ -284,11 +321,15 @@ def start_client():
 
                 print(f"Message {message_id[:8]}: Sending…")
 
-                send_event(client, {
-                    "type": "chat",
-                    "message_id": message_id,
-                    "message": message
-                })
+                try:
+                    send_event(client, {
+                        "type": "chat",
+                        "message_id": message_id,
+                        "message": message
+                    })
+                except OSError:
+                    print("Could not send message.")
+                    break
 
     except ConnectionRefusedError:
         print("Could not connect. Start the server first.")

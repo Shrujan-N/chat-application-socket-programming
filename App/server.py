@@ -1,4 +1,3 @@
-
 import json
 import socket
 import threading
@@ -19,8 +18,9 @@ clients_lock = threading.RLock()
 
 def send_event(connection, event):
     try:
-        data = json.dumps(event) + "\n"
-        connection.sendall(data.encode("utf-8"))
+        connection.sendall(
+            (json.dumps(event) + "\n").encode("utf-8")
+        )
         return True
     except OSError:
         return False
@@ -50,26 +50,338 @@ def send_status(username, message_id, status, message=None):
         send_event(connection, event)
 
 
-def queue_message(username, event):
-    with clients_lock:
-        queue = offline_messages.setdefault(username, [])
-
-        if not any(
-            item.get("message_id") == event.get("message_id")
-            and item.get("type") == event.get("type")
-            for item in queue
-        ):
-            queue.append(event)
-
-
 def remove_queued_message(username, message_id):
     with clients_lock:
         queue = offline_messages.get(username, [])
-
         offline_messages[username] = [
             event for event in queue
             if event.get("message_id") != message_id
         ]
+
+
+def notify_group(group, message, exclude=None):
+    exclude = exclude or set()
+
+    with clients_lock:
+        recipients = [
+            clients[member]
+            for member in group["members"]
+            if member in clients and member not in exclude
+        ]
+
+    for connection in recipients:
+        send_text(connection, message)
+
+
+def group_help(connection):
+    send_text(
+        connection,
+        "Group management commands:\n"
+        "/group-info name\n"
+        "/group-add name username\n"
+        "/group-remove name username\n"
+        "/group-rename oldname newname\n"
+        "/group-icon name emoji\n"
+        "/group-admin name username\n"
+        "/group-admin-remove name username\n"
+        "Only group admins can manage members, names, icons and roles."
+    )
+
+
+def find_group(name):
+    return groups.get(name.casefold())
+
+
+def group_management(connection, username, command):
+    parts = command.split()
+
+    if not parts:
+        return False
+
+    action = parts[0]
+
+    if action == "/group-help":
+        group_help(connection)
+        return True
+
+    if action == "/group-info":
+        if len(parts) != 2:
+            send_text(connection, "Usage: /group-info name")
+            return True
+
+        with clients_lock:
+            group = find_group(parts[1])
+
+            if not group or username not in group["members"]:
+                send_text(connection, "Group not found or you are not a member.")
+                return True
+
+            members = sorted(group["members"])
+            admins = sorted(group["admins"])
+
+            details = (
+                f"Group: {group['icon']} {group['name']}\n"
+                f"Creator: {group['creator']}\n"
+                f"Admins: {', '.join(admins)}\n"
+                f"Members: {', '.join(members)}"
+            )
+
+        send_text(connection, details)
+        return True
+
+    if action == "/group-add":
+        if len(parts) != 3:
+            send_text(connection, "Usage: /group-add name username")
+            return True
+
+        group_name, target = parts[1], parts[2]
+
+        with clients_lock:
+            group = find_group(group_name)
+
+            if not group:
+                send_text(connection, "Group not found.")
+                return True
+
+            if username not in group["admins"]:
+                send_text(connection, "Only group admins can add members.")
+                return True
+
+            if target in group["members"]:
+                send_text(connection, f"{target} is already a member.")
+                return True
+
+            group["members"].add(target)
+            user_groups.setdefault(target, set()).add(
+                group["name"].casefold()
+            )
+            target_connection = clients.get(target)
+            group_copy = dict(group)
+            group_copy["members"] = set(group["members"])
+
+        send_text(connection, f"Added {target} to {group_copy['name']}.")
+
+        if target_connection:
+            send_text(
+                target_connection,
+                f"You were added to group {group_copy['icon']} "
+                f"{group_copy['name']} by {username}."
+            )
+
+        notify_group(
+            group_copy,
+            f"{target} was added to the group by {username}.",
+            exclude={username, target}
+        )
+        return True
+
+    if action == "/group-remove":
+        if len(parts) != 3:
+            send_text(connection, "Usage: /group-remove name username")
+            return True
+
+        group_name, target = parts[1], parts[2]
+
+        with clients_lock:
+            group = find_group(group_name)
+
+            if not group:
+                send_text(connection, "Group not found.")
+                return True
+
+            if username not in group["admins"]:
+                send_text(connection, "Only group admins can remove members.")
+                return True
+
+            if target not in group["members"]:
+                send_text(connection, f"{target} is not a member.")
+                return True
+
+            if target == group["creator"]:
+                send_text(connection, "The group creator cannot be removed.")
+                return True
+
+            group["members"].remove(target)
+            group["admins"].discard(target)
+            user_groups.get(target, set()).discard(
+                group["name"].casefold()
+            )
+
+            if active_groups.get(target) == group["name"].casefold():
+                active_groups.pop(target, None)
+
+            target_connection = clients.get(target)
+            group_copy = dict(group)
+            group_copy["members"] = set(group["members"])
+
+        send_text(connection, f"Removed {target} from {group_copy['name']}.")
+
+        if target_connection:
+            send_text(
+                target_connection,
+                f"You were removed from group {group_copy['name']}."
+            )
+
+        notify_group(
+            group_copy,
+            f"{target} was removed from the group by {username}."
+        )
+        return True
+
+    if action == "/group-rename":
+        if len(parts) != 3:
+            send_text(connection, "Usage: /group-rename oldname newname")
+            return True
+
+        old_name, new_name = parts[1], parts[2]
+        old_key = old_name.casefold()
+        new_key = new_name.casefold()
+
+        if not new_name or len(new_name) > 40:
+            send_text(connection, "The new name must be 1–40 characters.")
+            return True
+
+        with clients_lock:
+            group = groups.get(old_key)
+
+            if not group:
+                send_text(connection, "Group not found.")
+                return True
+
+            if username not in group["admins"]:
+                send_text(connection, "Only group admins can rename a group.")
+                return True
+
+            if new_key in groups and new_key != old_key:
+                send_text(connection, "A group with that name already exists.")
+                return True
+
+            if new_key != old_key:
+                groups.pop(old_key)
+                groups[new_key] = group
+
+                for member in group["members"]:
+                    memberships = user_groups.setdefault(member, set())
+                    memberships.discard(old_key)
+                    memberships.add(new_key)
+
+                for member, current_key in list(active_groups.items()):
+                    if current_key == old_key:
+                        active_groups[member] = new_key
+
+            old_display_name = group["name"]
+            group["name"] = new_name
+            group_copy = dict(group)
+            group_copy["members"] = set(group["members"])
+
+        notify_group(
+            group_copy,
+            f"Group '{old_display_name}' was renamed to '{new_name}' by {username}."
+        )
+        send_text(connection, f"Group renamed to '{new_name}'.")
+        return True
+
+    if action == "/group-icon":
+        if len(parts) != 3:
+            send_text(connection, "Usage: /group-icon name emoji")
+            return True
+
+        group_name, icon = parts[1], parts[2]
+
+        with clients_lock:
+            group = find_group(group_name)
+
+            if not group:
+                send_text(connection, "Group not found.")
+                return True
+
+            if username not in group["admins"]:
+                send_text(connection, "Only group admins can change the icon.")
+                return True
+
+            group["icon"] = icon
+            group_copy = dict(group)
+            group_copy["members"] = set(group["members"])
+
+        notify_group(
+            group_copy,
+            f"The icon for group '{group_copy['name']}' was changed to "
+            f"{icon} by {username}."
+        )
+        return True
+
+    if action == "/group-admin":
+        if len(parts) != 3:
+            send_text(connection, "Usage: /group-admin name username")
+            return True
+
+        group_name, target = parts[1], parts[2]
+
+        with clients_lock:
+            group = find_group(group_name)
+
+            if not group:
+                send_text(connection, "Group not found.")
+                return True
+
+            if username not in group["admins"]:
+                send_text(connection, "Only group admins can assign admins.")
+                return True
+
+            if target not in group["members"]:
+                send_text(connection, "That user is not a group member.")
+                return True
+
+            group["admins"].add(target)
+            group_copy = dict(group)
+            group_copy["members"] = set(group["members"])
+
+        notify_group(
+            group_copy,
+            f"{target} was made a group admin by {username}."
+        )
+        return True
+
+    if action == "/group-admin-remove":
+        if len(parts) != 3:
+            send_text(
+                connection,
+                "Usage: /group-admin-remove name username"
+            )
+            return True
+
+        group_name, target = parts[1], parts[2]
+
+        with clients_lock:
+            group = find_group(group_name)
+
+            if not group:
+                send_text(connection, "Group not found.")
+                return True
+
+            if username not in group["admins"]:
+                send_text(connection, "Only group admins can remove admins.")
+                return True
+
+            if target == group["creator"]:
+                send_text(connection, "The creator must remain an admin.")
+                return True
+
+            if target not in group["admins"]:
+                send_text(connection, f"{target} is not an admin.")
+                return True
+
+            group["admins"].remove(target)
+            group_copy = dict(group)
+            group_copy["members"] = set(group["members"])
+
+        notify_group(
+            group_copy,
+            f"{target} is no longer a group admin. Updated by {username}."
+        )
+        return True
+
+    return False
 
 
 def handle_chat(username, event):
@@ -82,7 +394,6 @@ def handle_chat(username, event):
 
     with clients_lock:
         sender_connection = clients.get(username)
-
         group_key = active_groups.get(username)
         group = groups.get(group_key) if group_key else None
 
@@ -92,6 +403,7 @@ def handle_chat(username, event):
                 "type": "group_message",
                 "message_id": message_id,
                 "group": group["name"],
+                "icon": group.get("icon", "👥"),
                 "sender": username,
                 "message": message
             }
@@ -131,15 +443,10 @@ def handle_chat(username, event):
 
         for recipient in recipients:
             queue = offline_messages.setdefault(recipient, [])
-
-            if not any(
-                item.get("message_id") == message_id
-                for item in queue
-            ):
+            if not any(item.get("message_id") == message_id for item in queue):
                 queue.append(message_event)
 
             recipient_connection = clients.get(recipient)
-
             if recipient_connection:
                 send_event(recipient_connection, message_event)
 
@@ -170,11 +477,12 @@ def handle_delivery(username, message_id):
 
 
 def handle_command(connection, username, command):
+    if group_management(connection, username, command):
+        return
+
     if command == "/contacts":
         with clients_lock:
-            online_users = [
-                name for name in clients if name != username
-            ]
+            online_users = [name for name in clients if name != username]
 
         send_text(
             connection,
@@ -187,39 +495,25 @@ def handle_command(connection, username, command):
         parts = command.split(maxsplit=2)
 
         if len(parts) < 3:
-            send_text(
-                connection,
-                "Usage: /group-create groupname username1,username2"
-            )
+            send_text(connection, "Usage: /group-create name username1,username2")
             return
 
         group_name = parts[1].strip()
         requested_members = [
-            name.strip()
-            for name in parts[2].split(",")
-            if name.strip()
+            name.strip() for name in parts[2].split(",") if name.strip()
         ]
         group_key = group_name.casefold()
 
-        if not group_name or not requested_members:
-            send_text(
-                connection,
-                "Provide a group name and at least one member."
-            )
+        if not group_name or len(group_name) > 40 or not requested_members:
+            send_text(connection, "Provide a group name (max 40 characters) and members.")
             return
 
         if len(set(requested_members)) != len(requested_members):
-            send_text(
-                connection,
-                "The member list contains duplicate usernames."
-            )
+            send_text(connection, "The member list contains duplicate usernames.")
             return
 
         if username in requested_members:
-            send_text(
-                connection,
-                "Do not include your own username; you are added automatically."
-            )
+            send_text(connection, "Do not include your own username; you are added automatically.")
             return
 
         with clients_lock:
@@ -227,26 +521,19 @@ def handle_command(connection, username, command):
                 send_text(connection, "That group name already exists.")
                 return
 
-            offline_members = [
-                name for name in requested_members
-                if name not in clients
-            ]
-
-            if offline_members:
-                send_text(
-                    connection,
-                    "These users are not online: "
-                    + ", ".join(offline_members)
-                )
+            offline = [name for name in requested_members if name not in clients]
+            if offline:
+                send_text(connection, "These users are not online: " + ", ".join(offline))
                 return
 
             members = set(requested_members)
             members.add(username)
-
             groups[group_key] = {
                 "name": group_name,
                 "creator": username,
-                "members": members
+                "members": members,
+                "admins": {username},
+                "icon": "👥"
             }
 
             for member in members:
@@ -254,37 +541,30 @@ def handle_command(connection, username, command):
 
             member_connections = {
                 member: clients.get(member)
-                for member in members
-                if member != username
+                for member in members if member != username
             }
 
         send_text(
             connection,
-            f"Group '{group_name}' created with {len(members)} members. "
+            f"Group '{group_name}' created. You are the admin. "
             f"Use /group {group_name} to chat."
         )
 
         for member, member_connection in member_connections.items():
             if member_connection:
-                send_text(
-                    member_connection,
-                    f"You were added to group '{group_name}' by {username}."
-                )
+                send_text(member_connection, f"You were added to group '{group_name}' by {username}.")
         return
 
     if command == "/groups":
         with clients_lock:
-            names = [
-                groups[key]["name"]
-                for key in user_groups.get(username, set())
-                if key in groups
-            ]
+            names = []
+            for key in user_groups.get(username, set()):
+                group = groups.get(key)
+                if group:
+                    role = " (admin)" if username in group["admins"] else ""
+                    names.append(f"{group.get('icon', '👥')} {group['name']}{role}")
 
-        send_text(
-            connection,
-            "Your groups: " + ", ".join(names)
-            if names else "You are not in any groups."
-        )
+        send_text(connection, "Your groups: " + ", ".join(names) if names else "You are not in any groups.")
         return
 
     if command.startswith("/group "):
@@ -293,27 +573,18 @@ def handle_command(connection, username, command):
 
         with clients_lock:
             group = groups.get(group_key)
-            is_member = bool(
-                group and username in group["members"]
-            )
+            is_member = bool(group and username in group["members"])
 
             if is_member:
                 active_groups[username] = group_key
-
                 target = active_chats.pop(username, None)
                 if target and active_chats.get(target) == username:
                     active_chats.pop(target, None)
 
         if not is_member:
-            send_text(
-                connection,
-                f"You are not a member of group '{group_name}'."
-            )
+            send_text(connection, f"You are not a member of group '{group_name}'.")
         else:
-            send_text(
-                connection,
-                f"Switched to group chat '{group['name']}'."
-            )
+            send_text(connection, f"Switched to group chat '{group['icon']} {group['name']}'.")
         return
 
     if command.startswith("/chat "):
@@ -325,47 +596,30 @@ def handle_command(connection, username, command):
 
         with clients_lock:
             active_groups.pop(username, None)
+            previous = active_chats.get(username)
 
-            previous_target = active_chats.get(username)
-            if (
-                previous_target
-                and active_chats.get(previous_target) == username
-            ):
-                active_chats.pop(previous_target, None)
+            if previous and active_chats.get(previous) == username:
+                active_chats.pop(previous, None)
 
             active_chats[username] = target
             active_chats[target] = username
             target_connection = clients.get(target)
 
-        send_text(
-            connection,
-            f"Private chat selected with {target}. "
-            "Messages will be delivered when they reconnect."
-        )
-
+        send_text(connection, f"Private chat selected with {target}.")
         if target_connection:
-            send_text(
-                target_connection,
-                f"Private chat started with {username}. "
-                "You can now reply directly."
-            )
+            send_text(target_connection, f"Private chat started with {username}.")
         return
 
     if command == "/back":
         with clients_lock:
             group_key = active_groups.pop(username, None)
-
             if group_key:
                 group = groups.get(group_key)
                 group_name = group["name"] if group else group_key
-                send_text(
-                    connection,
-                    f"You left the active group chat '{group_name}'."
-                )
+                send_text(connection, f"You left the active group chat '{group_name}'.")
                 return
 
             target = active_chats.pop(username, None)
-
             if target and active_chats.get(target) == username:
                 active_chats.pop(target, None)
                 target_connection = clients.get(target)
@@ -373,30 +627,24 @@ def handle_command(connection, username, command):
                 target_connection = None
 
         send_text(connection, "You left the private chat.")
-
         if target_connection:
-            send_text(
-                target_connection,
-                f"{username} left the private chat."
-            )
+            send_text(target_connection, f"{username} left the private chat.")
         return
 
     if command == "/quit":
         raise ConnectionAbortedError
 
-    send_text(connection, "Unknown command.")
+    send_text(connection, "Unknown command. Use /group-help for group management commands.")
 
 
 def handle_client(connection, address):
     username = None
     reader = None
-
     print(f"Connection received: {address}")
 
     try:
         reader = connection.makefile("r", encoding="utf-8")
         send_text(connection, "Enter your username:")
-
         username = reader.readline().strip()
 
         if not username:
@@ -418,16 +666,11 @@ def handle_client(connection, address):
             queued = list(offline_messages.get(username, []))
 
         for event in queued:
-            with clients_lock:
-                if clients.get(username) is not connection:
-                    break
-
             if not send_event(connection, event):
                 break
 
         while True:
             line = reader.readline()
-
             if not line:
                 break
 
@@ -448,9 +691,7 @@ def handle_client(connection, address):
             elif event_type in ("typing", "stop_typing"):
                 with clients_lock:
                     target = active_chats.get(username)
-                    target_connection = (
-                        clients.get(target) if target else None
-                    )
+                    target_connection = clients.get(target) if target else None
 
                 if target_connection:
                     send_event(target_connection, {
@@ -460,11 +701,7 @@ def handle_client(connection, address):
 
             elif event_type == "command":
                 try:
-                    handle_command(
-                        connection,
-                        username,
-                        event.get("message", "").strip()
-                    )
+                    handle_command(connection, username, event.get("message", "").strip())
                 except ConnectionAbortedError:
                     break
 
@@ -478,13 +715,11 @@ def handle_client(connection, address):
 
             if username:
                 target = active_chats.pop(username, None)
-
                 if target and active_chats.get(target) == username:
                     active_chats.pop(target, None)
-
                 active_groups.pop(username, None)
 
-        if reader is not None:
+        if reader:
             try:
                 reader.close()
             except OSError:
@@ -514,10 +749,8 @@ def start_server():
                 args=(connection, address),
                 daemon=True
             ).start()
-
     except KeyboardInterrupt:
         print("\nServer stopped.")
-
     finally:
         server.close()
 
