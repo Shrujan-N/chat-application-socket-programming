@@ -1,2 +1,13 @@
 __pycache__/
 *.py[cod]
+venv/
+.venv/
+*.db
+*.sqlite
+chat_app.db
+uploads/*
+!uploads/.gitkeep
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
