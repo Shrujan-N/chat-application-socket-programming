@@ -48,18 +48,33 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
             if data.get("type") == "send_message":
                 recipient = data.get("recipient")
                 content = data.get("content")
+                msg_id = data.get("msg_id", str(os.urandom(4).hex()))
+                timestamp = data.get("timestamp")
                 
                 incoming_frame = {
                     "type": "receive_message",
+                    "msg_id": msg_id,
                     "sender": username,
                     "recipient": recipient,
                     "content": content,
-                    "timestamp": data.get("timestamp")
+                    "timestamp": timestamp
                 }
                 
-                # Targeted real-time delivery to online recipient (ADDED FOR ISSUE #20)
                 if recipient in manager.active_connections:
                     await manager.active_connections[recipient].send_json(incoming_frame)
+                    # Send 'delivered' status ACK back to sender (ADDED FOR ISSUE #22)
+                    await websocket.send_json({"type": "status_update", "msg_id": msg_id, "status": "delivered"})
+
+            # Handle Read Receipt ACK frames from recipient (ADDED FOR ISSUE #22)
+            elif data.get("type") == "read_ack":
+                sender = data.get("sender")
+                msg_id = data.get("msg_id")
+                if sender in manager.active_connections:
+                    await manager.active_connections[sender].send_json({
+                        "type": "status_update",
+                        "msg_id": msg_id,
+                        "status": "read"
+                    })
     except WebSocketDisconnect:
         manager.disconnect(username)
 

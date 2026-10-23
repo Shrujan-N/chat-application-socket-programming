@@ -204,12 +204,33 @@
         function handleIncomingSignal(data) {
             if (data.type === "receive_message") {
                 if (activeContact === data.sender) {
-                    appendMessageUI(data.sender, data.content, data.timestamp, 'delivered', data.msg_id || Date.now());
+                    appendMessageUI(data.sender, data.content, data.timestamp, 'delivered', data.msg_id);
+                    
+                    // Send Read Receipt ACK back to sender (ADDED FOR ISSUE #22)
+                    ws.send(JSON.stringify({
+                        type: "read_ack",
+                        msg_id: data.msg_id,
+                        sender: data.sender,
+                        reader: currentUser
+                    }));
                 } else {
                     alert(`New message from ${data.sender}!`);
                 }
             }
+            // Update Checkmark Visual State (ADDED FOR ISSUE #22)
+            else if (data.type === "status_update") {
+                const statusElem = document.getElementById(`status-${data.msg_id}`);
+                if (statusElem) {
+                    if (data.status === 'delivered') {
+                        statusElem.innerHTML = '&#10003;&#10003;';
+                    } else if (data.status === 'read') {
+                        statusElem.innerHTML = '&#10003;&#10003;';
+                        statusElem.className = 'message-status read';
+                    }
+                }
+            }
         }
+        
         function handleSearch() {}
 
         function sendMessage() {
@@ -221,8 +242,10 @@
                 return;
             }
 
+            const msgId = 'msg-' + Date.now();
             const payload = {
                 type: "send_message",
+                msg_id: msgId,
                 sender: currentUser,
                 recipient: activeContact,
                 content: content,
@@ -230,7 +253,7 @@
             };
 
             ws.send(JSON.stringify(payload));
-            appendMessageUI(currentUser, content, payload.timestamp, 'sending', 'temp-' + Date.now());
+            appendMessageUI(currentUser, content, payload.timestamp, 'sent', msgId);
             input.value = '';
         }
 
