@@ -1,3 +1,4 @@
+
 import json
 import socket
 import threading
@@ -147,6 +148,13 @@ def group_management(connection, username, command):
 
             if username not in group["admins"]:
                 send_text(connection, "Only group admins can add members.")
+                return True
+
+            if target not in clients and target not in user_groups:
+                send_text(
+                    connection,
+                    "That user has not connected to the server before."
+                )
                 return True
 
             if target in group["members"]:
@@ -446,7 +454,9 @@ def handle_chat(username, event):
         message_store[message_id] = {
             "sender": username,
             "recipients": set(recipients),
-            "event": dict(message_event)
+            "event": dict(message_event),
+            "deleted": False,
+            "deleted_for": set()
         }
 
         pending_messages[message_id] = {
@@ -471,6 +481,18 @@ def handle_chat(username, event):
     send_status(username, message_id, "sent")
 
 
+def find_message_id(prefix):
+    matches = [
+        message_id for message_id in message_store
+        if message_id.startswith(prefix)
+    ]
+
+    if len(matches) != 1:
+        return None
+
+    return matches[0]
+
+
 def handle_edit(connection, username, command):
     parts = command.split(maxsplit=2)
 
@@ -490,21 +512,24 @@ def handle_edit(connection, username, command):
         return
 
     with clients_lock:
-        matches = [
-            message_id
-            for message_id in message_store
-            if message_id.startswith(message_id_prefix)
-        ]
+        message_id = find_message_id(message_id_prefix)
 
-        if len(matches) != 1:
+        if message_id is None:
             send_text(
                 connection,
                 "Message ID not found or ambiguous. Use the full ID."
             )
             return
 
-        message_id = matches[0]
         record = message_store[message_id]
+
+        if record.get("deleted"):
+            send_text(connection, "This message has been deleted.")
+            return
+
+        if record.get("deleted_for") and username in record["deleted_for"]:
+            send_text(connection, "This message is deleted from your view.")
+            return
 
         if record["sender"] != username:
             send_text(connection, "You can only edit your own messages.")
@@ -522,7 +547,7 @@ def handle_edit(connection, username, command):
                     queued_event["edited"] = True
 
         recipient_connections = [
-            (recipient, clients[recipient])
+            clients[recipient]
             for recipient in recipients
             if recipient in clients
         ]
@@ -535,10 +560,104 @@ def handle_edit(connection, username, command):
             "edited": True
         }
 
-    for recipient, recipient_connection in recipient_connections:
+    for recipient_connection in recipient_connections:
         send_event(recipient_connection, updated_event)
 
     send_text(connection, f"Message {message_id[:8]} edited successfully.")
+
+
+def handle_delete(connection, username, command):
+    parts = command.split(maxsplit=2)
+
+    if len(parts) != 3 or parts[2].casefold() not in {"me", "everyone"}:
+        send_text(connection, "Usage: /delete message_id me|everyone")
+        return
+
+    message_id_prefix = parts[1]
+    scope = parts[2].casefold()
+
+    with clients_lock:
+        message_id = find_message_id(message_id_prefix)
+
+        if message_id is None:
+            send_text(
+                connection,
+                "Message ID not found or ambiguous. Use the full ID."
+            )
+            return
+
+        record = message_store[message_id]
+
+        if record.get("deleted"):
+            send_text(connection, "This message has already been deleted.")
+            return
+
+        sender = record["sender"]
+        recipients = set(record["recipients"])
+        participants = recipients | {sender}
+
+        if username not in participants:
+            send_text(connection, "You are not a participant in this message.")
+            return
+
+        if scope == "everyone":
+            if username != sender:
+                send_text(
+                    connection,
+                    "Only the original sender can delete for everyone."
+                )
+                return
+
+            record["deleted"] = True
+            record["deleted_for"] = set(participants)
+            record["event"]["message"] = "This message was deleted."
+            record["event"]["deleted"] = True
+
+            for participant in participants:
+                offline_messages[participant] = [
+                    event
+                    for event in offline_messages.get(participant, [])
+                    if event.get("message_id") != message_id
+                ]
+
+            connections = [
+                clients[participant]
+                for participant in participants
+                if participant in clients
+            ]
+
+            delete_event = {
+                "type": "message_delete",
+                "message_id": message_id,
+                "sender": sender,
+                "scope": "everyone"
+            }
+        else:
+            record.setdefault("deleted_for", set()).add(username)
+
+            offline_messages[username] = [
+                event
+                for event in offline_messages.get(username, [])
+                if event.get("message_id") != message_id
+            ]
+
+            user_connection = clients.get(username)
+            connections = [user_connection] if user_connection else []
+
+            delete_event = {
+                "type": "message_delete",
+                "message_id": message_id,
+                "sender": sender,
+                "scope": "me"
+            }
+
+    for recipient_connection in connections:
+        send_event(recipient_connection, delete_event)
+
+    if scope == "everyone":
+        send_text(connection, f"Message {message_id[:8]} deleted for everyone.")
+    else:
+        send_text(connection, f"Message {message_id[:8]} deleted for you.")
 
 
 def handle_delivery(username, message_id):
@@ -567,6 +686,10 @@ def handle_delivery(username, message_id):
 def handle_command(connection, username, command):
     if command.startswith("/edit "):
         handle_edit(connection, username, command)
+        return
+
+    if command.startswith("/delete "):
+        handle_delete(connection, username, command)
         return
 
     if group_management(connection, username, command):
@@ -826,6 +949,12 @@ def handle_client(connection, address):
             queued = [
                 dict(event)
                 for event in offline_messages.get(username, [])
+                if not message_store.get(
+                    event.get("message_id"), {}
+                ).get("deleted")
+                and username not in message_store.get(
+                    event.get("message_id"), {}
+                ).get("deleted_for", set())
             ]
 
         for event in queued:
