@@ -1,3 +1,4 @@
+
 import json
 import socket
 import threading
@@ -154,6 +155,21 @@ def receive_messages(reader, client, stop_event):
                     f"(ID: {message_id[:8]})"
                 )
 
+            elif event_type == "message_delete":
+                message_id = event.get("message_id", "")
+                scope = event.get("scope", "me")
+
+                if scope == "everyone":
+                    print(
+                        f"\n[DELETED] Message {message_id[:8]} "
+                        "was deleted for everyone."
+                    )
+                else:
+                    print(
+                        f"\n[DELETED] Message {message_id[:8]} "
+                        "was removed from your view."
+                    )
+
             elif event_type == "typing":
                 print(
                     f"\n{event.get('username', 'Someone')} is typing..."
@@ -208,6 +224,7 @@ def is_command(message):
 
     prefixes = (
         "/edit ",
+        "/delete ",
         "/chat ",
         "/group ",
         "/group-create ",
@@ -232,6 +249,8 @@ def print_help():
     print("/group name                       Enter a group")
     print("/back                             Leave the active chat")
     print("/edit message_id new content      Edit your own message")
+    print("/delete message_id me             Delete a message from your view")
+    print("/delete message_id everyone       Delete your message for everyone")
     print("/help                             Show commands")
     print("/quit                             Disconnect")
 
