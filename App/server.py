@@ -1,4 +1,3 @@
-
 import re
 import bcrypt
 from db import get_connection
@@ -6,6 +5,23 @@ import json
 import socket
 import threading
 import uuid
+import os
+import jwt
+import time
+import select
+
+from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+from db import get_connection
+
+load_dotenv()
+
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_MINUTES = 15
+JWT_SECRET = os.getenv("JWT_SECRET")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_MINUTES = 30
+IDLE_TIMEOUT_MINUTES = 30
 
 HOST = "127.0.0.1"
 PORT = 5000
@@ -103,6 +119,63 @@ def register_user(email, username, password):
             connection.close()
 
 
+def log_login_event(username, status):
+    connection = None
+
+    try:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute("""
+            INSERT INTO login_logs (username, login_status)
+            VALUES (%s, %s)
+        """, (username, status))
+
+        connection.commit()
+
+    except Exception as error:
+        if connection:
+            connection.rollback()
+        print("Login logging error:", error)
+
+    finally:
+        if connection:
+            connection.close()
+
+def generate_jwt_token(username):
+    if not JWT_SECRET:
+        raise ValueError("JWT_SECRET is missing from .env")
+
+    now = datetime.now(timezone.utc)
+
+    payload = {
+        "sub": username,
+        "iat": now,
+        "exp": now + timedelta(minutes=JWT_EXPIRATION_MINUTES)
+    }
+
+    token = jwt.encode(
+        payload,
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM
+    )
+
+    return token
+def validate_jwt_token(token):
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM]
+        )
+        return payload["sub"]
+
+    except jwt.ExpiredSignatureError:
+        return None
+
+    except jwt.InvalidTokenError:
+        return None
+
 def login_user(username, password):
     connection = None
 
@@ -110,31 +183,122 @@ def login_user(username, password):
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
 
-        cursor.execute(
-            """
-            SELECT username, password_hash
+        cursor.execute("""
+            SELECT username, password_hash, failed_attempts, locked_until
             FROM users
             WHERE username = %s
-            """,
-            (username.strip(),)
-        )
+            FOR UPDATE
+        """, (username.strip(),))
 
         user = cursor.fetchone()
 
+        
         if not user:
+            connection.rollback()
+            log_login_event(username.strip(), "FAILED")
             return False, "Invalid username or password."
 
+
+        now = datetime.now()
+
+        # Check whether the account is locked
+        if user["locked_until"] and user["locked_until"] > now:
+            remaining = user["locked_until"] - now
+            minutes = max(
+                1,
+                int(remaining.total_seconds() // 60) + 1
+            )
+
+            connection.rollback()
+            log_login_event(username.strip(), "LOCKED")
+            return False, (
+                f"Account temporarily locked. "
+                f"Try again in about {minutes} minute(s)."
+            )
+
+        # Reset attempts if the lockout period has expired
+        if user["locked_until"] and user["locked_until"] <= now:
+            cursor.execute("""
+                UPDATE users
+                SET failed_attempts = 0, locked_until = NULL
+                WHERE username = %s
+            """, (username.strip(),))
+
+            user["failed_attempts"] = 0
+            user["locked_until"] = None
+
+        # Check the password
         password_matches = bcrypt.checkpw(
             password.encode("utf-8"),
             user["password_hash"].encode("utf-8")
         )
 
         if not password_matches:
-            return False, "Invalid username or password."
+            attempts = user["failed_attempts"] + 1
+
+            # Lock the account after five failed attempts
+            if attempts >= MAX_FAILED_ATTEMPTS:
+                locked_until = now + timedelta(
+                    minutes=LOCKOUT_MINUTES
+                )
+
+                cursor.execute("""
+                    UPDATE users
+                    SET failed_attempts = %s, locked_until = %s
+                    WHERE username = %s
+                """, (
+                    attempts,
+                    locked_until,
+                    username.strip()
+                ))
+
+                
+                connection.commit()
+                log_login_event(username.strip(), "LOCKED")
+
+                return False, (
+                    "Account locked after 5 failed login attempts. "
+                    "Try again in 15 minutes."
+                )
+
+
+            # Save the failed attempt count
+            
+            cursor.execute("""
+                UPDATE users
+                SET failed_attempts = %s
+                WHERE username = %s
+            """, (attempts, username.strip()))
+
+            connection.commit()
+            log_login_event(username.strip(), "FAILED")
+
+            remaining_attempts = MAX_FAILED_ATTEMPTS - attempts
+
+            return False, (
+                "Invalid username or password. "
+                f"{remaining_attempts} attempt(s) remaining before lockout."
+            )
+
+
+        # Successful login: reset failed attempts
+        cursor.execute("""
+            UPDATE users
+            SET failed_attempts = 0, locked_until = NULL
+            WHERE username = %s
+        """, (username.strip(),))
+
+        
+        connection.commit()
+        log_login_event(username.strip(), "SUCCESS")
 
         return True, "Login successful!"
 
+
     except Exception as error:
+        if connection:
+            connection.rollback()
+
         print("Login database error:", error)
         return False, "Login failed due to a server error."
 
@@ -233,19 +397,64 @@ def handle_client(connection, address):
             })
             return
 
+        token = generate_jwt_token(username)
+
         send_event(connection, {
             "type": "auth_result",
             "success": True,
-            "message": f"Welcome, {username}!"
-        })
+            "message": f"Welcome, {username}!",
+            "token": token
+      })
 
         print(f"{username} is now online.")
 
-        while True:
+        last_activity = time.monotonic()
+        session_active = threading.Event()
+        session_active.set()
+
+        def monitor_idle_session():
+            while session_active.is_set():
+                time.sleep(10)
+
+                if time.monotonic() - last_activity >= IDLE_TIMEOUT_MINUTES * 60:
+                    print(f"{username}'s session expired due to inactivity.")
+                    session_active.clear()
+
+                    try:
+                        send_event(connection, {
+                            "type": "auth_result",
+                            "success": False,
+                            "message": "Session expired due to inactivity. Please log in again."
+                        })
+                    except (OSError, ValueError):
+                        pass
+
+                    try:
+                        connection.shutdown(2)
+                    except OSError:
+                        pass
+
+                    try:
+                        connection.close()
+                    except OSError:
+                        pass
+
+                    break
+
+        idle_monitor = threading.Thread(
+            target=monitor_idle_session,
+            daemon=True
+        )
+        idle_monitor.start()
+
+        while session_active.is_set():
             line = reader.readline()
+
             if not line:
                 break
 
+            last_activity = time.monotonic()
+           
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
@@ -253,6 +462,20 @@ def handle_client(connection, address):
                 continue
 
             event_type = event.get("type")
+
+            # Validate the token supplied by the client
+            client_token = event.get("token")
+            validated_username = validate_jwt_token(client_token)
+
+            if validated_username != username:
+                send_event(connection, {
+                    "type": "auth_result",
+                    "success": False,
+                    "message": "Invalid or expired session token. Please log in again."
+                })
+                break
+
+             
 
             if event_type == "chat":
                 message = event.get("message", "").strip()
@@ -390,6 +613,9 @@ def handle_client(connection, address):
         print(f"Connection error for {username or address}: {error}")
 
     finally:
+        if "session_active" in locals():
+            session_active.clear()
+
         with clients_lock:
             if username and clients.get(username) is connection:
                 del clients[username]

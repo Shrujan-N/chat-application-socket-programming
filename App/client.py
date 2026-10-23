@@ -10,6 +10,8 @@ PORT = 5000
 pending_status = {}
 status_lock = threading.Lock()
 
+auth_token = None
+
 
 def send_event(client, event):
     data = json.dumps(event) + "\n"
@@ -46,9 +48,9 @@ def receive_messages(reader, client, stop_event):
 
                 send_event(client, {
                     "type": "delivered",
-                    "message_id": message_id
+                    "message_id": message_id,
+                    "token": auth_token
                 })
-
             elif event_type == "status":
                 message_id = event.get("message_id")
                 status = event.get("status", "unknown")
@@ -65,9 +67,16 @@ def receive_messages(reader, client, stop_event):
                         f"\nMessage {message_id[:8]}: Failed — "
                         f"{event.get('message', 'Delivery failed')}"
                     )
+                elif event_type == "auth_result":
+                    print(
+                        event.get(
+                            "message",
+                            "Session expired. Please log in again."
+                        )
+                    )
 
-            else:
-                print(f"\nUnknown server event: {event}")
+        else:
+            print(f"\nUnknown server event: {event}")
 
     except (OSError, ValueError):
         pass
@@ -120,6 +129,14 @@ def authenticate(client, reader):
     if not response.get("success", False):
         return None
 
+    if event["type"] == "login":
+        global auth_token
+        auth_token = response.get("token")
+
+        if not auth_token:
+            print("Login failed: JWT token was not received.")
+            return None
+
     if event["type"] == "register":
         print("Please log in using your new account.")
         return None
@@ -162,7 +179,8 @@ def start_client():
             if message.lower() == "/quit":
                 send_event(client, {
                     "type": "command",
-                    "message": "/quit"
+                    "message": "/quit",
+                    "token": auth_token
                 })
                 break
 
@@ -172,7 +190,8 @@ def start_client():
             ):
                 send_event(client, {
                     "type": "command",
-                    "message": message
+                    "message": message,
+                    "token": auth_token
                 })
 
             elif message:
@@ -186,7 +205,8 @@ def start_client():
                 send_event(client, {
                     "type": "chat",
                     "message_id": message_id,
-                    "message": message
+                    "message": message,
+                    "token": auth_token
                 })
 
     except ConnectionRefusedError:
