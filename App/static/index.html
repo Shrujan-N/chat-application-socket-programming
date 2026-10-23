@@ -198,6 +198,23 @@
             activeContact = contact;
             document.getElementById('chat-header').innerText = `Chatting with: ${contact}`;
             loadContacts();
+            loadHistory(); // Load stored history (ADDED FOR ISSUE #23)
+        }
+
+        // --- Fetch Chat History from SQLite (ADDED FOR ISSUE #23) ---
+        async function loadHistory() {
+            if (!activeContact) return;
+            const response = await fetch(`/api/messages/history/${currentUser}/${activeContact}`);
+            const data = await response.json();
+            
+            const list = document.getElementById('messages-list');
+            list.innerHTML = '';
+            
+            if (data.history) {
+                data.history.forEach(msg => {
+                    appendMessageUI(msg.sender, msg.content, msg.timestamp, msg.status, msg.msg_id);
+                });
+            }
         }
 
         // --- Receive Text Message Event Handler (ADDED FOR ISSUE #20) ---
@@ -230,7 +247,7 @@
                 }
             }
         }
-        
+
         function handleSearch() {}
 
         function sendMessage() {

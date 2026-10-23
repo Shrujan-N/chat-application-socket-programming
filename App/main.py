@@ -50,6 +50,16 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 content = data.get("content")
                 msg_id = data.get("msg_id", str(os.urandom(4).hex()))
                 timestamp = data.get("timestamp")
+
+                # Store message permanently in SQLite Database (ADDED FOR ISSUE #23)
+                conn = get_db()
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO messages (msg_id, sender, recipient, content, timestamp, status)
+                    VALUES (?, ?, ?, ?, ?, 'sent')
+                """, (msg_id, username, recipient, content, timestamp))
+                conn.commit()
+                conn.close()
                 
                 incoming_frame = {
                     "type": "receive_message",
@@ -176,3 +186,18 @@ async def remove_contact(payload: RemoveContactSchema):
     conn.commit()
     conn.close()
     return {"success": True, "message": f"Removed '{payload.contact_username}' from contacts"}
+
+# --- Fetch Conversation History Endpoint (ADDED FOR ISSUE #23) ---
+@app.get("/api/messages/history/{user1}/{user2}")
+async def get_chat_history(user1: str, user2: str):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT msg_id, sender, recipient, content, timestamp, status 
+        FROM messages 
+        WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)
+        ORDER BY id ASC
+    """, (user1, user2, user2, user1))
+    rows = cursor.fetchall()
+    conn.close()
+    return {"history": [dict(row) for row in rows]}
