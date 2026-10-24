@@ -48,6 +48,9 @@
         .auth-error { color: #ff8080; font-size: 13px; margin-top: 8px; }
         .auth-info { color: #5fd38d; font-size: 13px; margin-top: 8px; }
         .hint { font-size: 12px; color: #8696a0; }
+        .link-btn { background: none; border: none; padding: 0; color: #53bdeb; font-weight: normal; font-size: 13px; text-decoration: underline; cursor: pointer; }
+        .link-btn:hover { background: none; color: #8fd3f4; }
+        .auth-form .secondary { background: #232d3f; margin-top: 8px; }
     </style>
 </head>
 <body>
@@ -68,6 +71,7 @@
                 <p id="login-info" class="auth-info" role="status" hidden></p>
                 <p id="login-error" class="auth-error" role="alert" hidden></p>
                 <button id="login-submit" class="primary" type="submit">Log in</button>
+                <p class="hint" style="margin-top:10px;"><button type="button" class="link-btn" onclick="showForgot()">Forgot password?</button></p>
             </form>
  
             <form id="register-form" class="auth-form" onsubmit="handleRegister(event)" novalidate hidden>
@@ -80,6 +84,29 @@
                 <p class="hint">At least 8 characters with upper-case, lower-case and a number.</p>
                 <p id="register-error" class="auth-error" role="alert" hidden></p>
                 <button id="register-submit" class="primary" type="submit">Register</button>
+            </form>
+ 
+            <!-- Password recovery (FR-04): request a reset link -->
+            <form id="forgot-form" class="auth-form" onsubmit="handleForgot(event)" novalidate hidden>
+                <p class="hint">Enter your registered email and we will send you a reset link.</p>
+                <label for="forgot-email">Email</label>
+                <input id="forgot-email" type="text" autocomplete="email">
+                <p id="forgot-info" class="auth-info" role="status" hidden></p>
+                <p id="forgot-error" class="auth-error" role="alert" hidden></p>
+                <button id="forgot-submit" class="primary" type="submit">Send reset link</button>
+                <button type="button" class="secondary" onclick="showAuthTab('login')">Back to log in</button>
+            </form>
+ 
+            <!-- Password recovery (FR-04): choose a new password from the emailed link -->
+            <form id="reset-form" class="auth-form" onsubmit="handleReset(event)" novalidate hidden>
+                <p class="hint">Choose a new password for your account.</p>
+                <label for="reset-password">New password</label>
+                <input id="reset-password" type="password" autocomplete="new-password">
+                <label for="reset-confirm">Confirm new password</label>
+                <input id="reset-confirm" type="password" autocomplete="new-password">
+                <p class="hint">At least 8 characters with upper-case, lower-case and a number.</p>
+                <p id="reset-error" class="auth-error" role="alert" hidden></p>
+                <button id="reset-submit" class="primary" type="submit">Reset password</button>
             </form>
         </div>
     </div>
@@ -146,7 +173,7 @@
         const rawFetch = window.fetch.bind(window);
         window.fetch = async function(url, opts = {}) {
             const isApi = typeof url === 'string' && url.startsWith('/api/');
-            const isPublic = isApi && (url.startsWith('/api/login') || url.startsWith('/api/register'));
+            const isPublic = isApi && (url.startsWith('/api/login') || url.startsWith('/api/register') || url.startsWith('/api/password/'));
             if (isApi && !isPublic && authToken) {
                 opts.headers = Object.assign({}, opts.headers, { Authorization: 'Bearer ' + authToken });
             }
@@ -182,9 +209,96 @@
             const login = tab === 'login';
             document.getElementById('login-form').hidden = !login;
             document.getElementById('register-form').hidden = login;
+            document.getElementById('forgot-form').hidden = true;
+            document.getElementById('reset-form').hidden = true;
+            document.querySelector('.auth-tabs').hidden = false;
             document.getElementById('tab-login').classList.toggle('active', login);
             document.getElementById('tab-register').classList.toggle('active', !login);
             setText('login-error', ''); setText('register-error', '');
+            setText('forgot-error', ''); setText('forgot-info', '');
+        }
+ 
+        // ---------- Password recovery (FR-04) ----------
+        let resetToken = null;
+ 
+        function showForgot() {
+            showAuthTab('login');
+            document.getElementById('login-form').hidden = true;
+            document.getElementById('forgot-form').hidden = false;
+            document.getElementById('tab-login').classList.remove('active');
+            document.getElementById('forgot-email').focus();
+        }
+ 
+        function showResetForm() {
+            showAuthTab('login');
+            document.getElementById('login-form').hidden = true;
+            document.getElementById('reset-form').hidden = false;
+            document.querySelector('.auth-tabs').hidden = true;
+            setText('reset-error', '');
+            document.getElementById('reset-password').focus();
+        }
+ 
+        async function handleForgot(event) {
+            event.preventDefault();
+            const button = document.getElementById('forgot-submit');
+            setText('forgot-error', ''); setText('forgot-info', '');
+            button.disabled = true;
+            try {
+                const data = await postJson('/api/password/forgot', {
+                    email: document.getElementById('forgot-email').value
+                });
+                setText('forgot-info', data.message);
+            } catch (error) {
+                setText('forgot-error', error.message);
+            } finally {
+                button.disabled = false;
+            }
+        }
+ 
+        async function handleReset(event) {
+            event.preventDefault();
+            const password = document.getElementById('reset-password').value;
+            const confirm = document.getElementById('reset-confirm').value;
+            setText('reset-error', '');
+            if (password !== confirm) {
+                setText('reset-error', 'Passwords do not match.');
+                return;
+            }
+            const button = document.getElementById('reset-submit');
+            button.disabled = true;
+            try {
+                await postJson('/api/password/reset', { token: resetToken, new_password: password });
+                resetToken = null;
+                storeToken(null);                       // any old saved session is no longer valid
+                document.getElementById('reset-form').reset();
+                showLoginScreen('Password reset successful. Please log in with your new password.');
+            } catch (error) {
+                setText('reset-error', error.message);
+            } finally {
+                button.disabled = false;
+            }
+        }
+ 
+        // Opened from the emailed link (…/#reset=TOKEN). Returns true if it handled the page.
+        async function handleResetLink() {
+            const match = window.location.hash.match(/^#reset=([A-Za-z0-9_\-]+)$/);
+            if (!match) return false;
+            resetToken = match[1];
+            history.replaceState(null, '', window.location.pathname);   // keep the token out of the address bar
+            document.getElementById('auth-screen').hidden = false;
+            try {
+                const response = await rawFetch('/api/password/verify', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token: resetToken })
+                });
+                const data = await response.json();
+                if (data.valid) { showResetForm(); return true; }
+            } catch (e) {}
+            resetToken = null;
+            showForgot();
+            setText('forgot-error', 'This reset link is invalid, expired or already used. Request a new one.');
+            return true;
         }
  
         function showLoginScreen(infoMessage) {
@@ -796,7 +910,7 @@
             ['mousemove', 'keydown', 'click', 'touchstart', 'scroll'].forEach(name =>
                 document.addEventListener(name, trackActivity, { passive: true, capture: true })
             );
-            restoreSession();   // shows the app if a valid token exists, otherwise the login screen
+            handleResetLink().then(handled => { if (!handled) restoreSession(); });   // reset link first; otherwise restore the saved session
         };
     </script>
 </body>

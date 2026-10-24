@@ -92,6 +92,7 @@ def create_token(username: str, ttl_seconds: int = None, sid: str = None) -> str
     header = _b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
     body = _b64(json.dumps({
         "sub": username, "iat": now, "exp": now + ttl_seconds,
+        "iat_ms": int(time.time() * 1000),
         "sid": sid or new_session_id(),
     }).encode())
     signing_input = f"{header}.{body}"

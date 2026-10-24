@@ -79,6 +79,26 @@ def init_db():
     );
     """)
     
+    # Password recovery (FR-04). Only a SHA-256 hash of each reset token is stored.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS password_resets (
+        token_hash TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0
+    );
+    """)
+
+    # When a password was last changed by a reset: sessions issued before that
+    # moment are no longer accepted.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS password_changes (
+        username TEXT PRIMARY KEY,
+        changed_at_ms INTEGER NOT NULL
+    );
+    """)
+    
     # Pre-seed initial users for testing if database is empty
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:

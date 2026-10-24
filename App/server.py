@@ -9,6 +9,7 @@ from security import SESSION_TIMEOUT_MINUTES, TokenError
 from auth_service import (
     AuthError, register_account, authenticate, record_event, user_exists,
     resume_session, refresh_session_token, revoke_session,
+    request_password_reset, reset_password, RESET_REQUEST_MESSAGE,
 )
 
 HOST = "127.0.0.1"
@@ -67,6 +68,8 @@ def authenticate_connection(connection, reader, address):
       {"type": "register", "username": ..., "email": ..., "password": ...}
       {"type": "login", "username": ..., "password": ...}
       {"type": "resume", "token": ...}      (return to a saved session)
+      {"type": "forgot_password", "email": ...}
+      {"type": "reset_password", "token": ..., "new_password": ...}
       {"type": "quit"}
     Returns (username, session_token, resumed), or (None, None, False) if the
     client leaves or exceeds the allowed number of attempts.
@@ -129,6 +132,28 @@ def authenticate_connection(connection, reader, address):
                     expires_in=result["expires_in"]
                 )
                 return result["username"], result["token"], True
+
+            elif event_type == "forgot_password":
+                ip = address[0] if address else None
+                email = event.get("email")
+                request_password_reset(email if isinstance(email, str) else "", ip)
+                send_auth_result(
+                    connection, True, "forgot_password", RESET_REQUEST_MESSAGE
+                )
+
+            elif event_type == "reset_password":
+                ip = address[0] if address else None
+                token = event.get("token")
+                new_password = event.get("new_password")
+                reset_password(
+                    token if isinstance(token, str) else "",
+                    new_password if isinstance(new_password, str) else "",
+                    ip
+                )
+                send_auth_result(
+                    connection, True, "reset_password",
+                    "Password reset successful. You can now log in with your new password."
+                )
 
             elif event_type == "quit":
                 return None, None, False
