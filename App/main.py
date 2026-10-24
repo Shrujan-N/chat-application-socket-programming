@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel
-from typing import Dict
+from typing import Dict, Optional
 from database import init_db, get_db
 from security import (
     hash_password, verify_password, create_token, decode_token,
@@ -19,6 +19,7 @@ from auth_service import (
     validate_session, revoke_session, AuthError, request_password_reset,
     reset_password, check_reset_token, RESET_REQUEST_MESSAGE,
 )
+import profile_service
  
  
 class RegisterSchema(BaseModel):
@@ -43,6 +44,11 @@ class VerifyResetSchema(BaseModel):
 class ResetPasswordSchema(BaseModel):
     token: str = ""
     new_password: str = ""
+
+
+class ProfileUpdateSchema(BaseModel):
+    display_name: Optional[str] = None
+    bio: Optional[str] = None
  
  
 MAX_FAILED_ATTEMPTS = 5
@@ -59,7 +65,7 @@ init_db()
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(APP_DIR, "static")
-UPLOADS_DIR = os.path.join(APP_DIR, "uploads")
+UPLOADS_DIR = profile_service.UPLOADS_DIR   # same folder as before (APP_DIR/uploads) unless CHAT_UPLOADS_DIR is set
 
 
 # --- Session protection: every /api route except register/login needs a valid token ---
@@ -422,6 +428,88 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
     except WebSocketDisconnect:
         manager.disconnect(username)
  
+# --- Profile Management (FR-05) ---
+def current_username(request: Request) -> str:
+    """The logged-in user, taken from the session token (never from the URL/body)."""
+    return validate_session(get_bearer_token(request))["sub"]
+
+
+def client_ip(request: Request):
+    return request.client.host if request.client else None
+
+
+async def broadcast_profile(username: str, profile: dict):
+    """Push the changed profile to the user's other open tabs and to every
+    online contact, so the change is visible immediately."""
+    targets = {username} | set(profile_service.contacts_of(username))
+    frame = {"type": "profile_update", "profile": profile}
+    for name in targets:
+        socket_ = manager.active_connections.get(name)
+        if socket_ is None:
+            continue
+        try:
+            await socket_.send_json(frame)
+        except Exception:
+            manager.disconnect(name)
+
+
+@app.get("/api/profiles")
+async def get_profiles_batch(users: str = ""):
+    """Profiles for a comma-separated list of usernames (used for the contact list)."""
+    return {"profiles": profile_service.get_profiles(users.split(","))}
+
+
+@app.get("/api/profile/{username}")
+async def get_user_profile(username: str):
+    try:
+        return {"success": True, "profile": profile_service.get_profile(username)}
+    except AuthError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail)
+
+
+@app.put("/api/profile")
+async def update_my_profile(payload: ProfileUpdateSchema, request: Request):
+    username = current_username(request)
+    try:
+        profile = await run_in_threadpool(
+            profile_service.update_profile,
+            username, payload.display_name, payload.bio, client_ip(request)
+        )
+    except AuthError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail)
+    await broadcast_profile(username, profile)
+    return {"success": True, "message": "Profile updated.", "profile": profile}
+
+
+@app.post("/api/profile/avatar")
+async def upload_my_avatar(request: Request, file: UploadFile = File(...)):
+    username = current_username(request)
+    # Read one byte past the limit so an oversized file is rejected without
+    # loading all of it into memory.
+    data = await file.read(profile_service.MAX_AVATAR_BYTES + 1)
+    try:
+        profile = await run_in_threadpool(
+            profile_service.set_avatar, username, data, client_ip(request)
+        )
+    except AuthError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail)
+    await broadcast_profile(username, profile)
+    return {"success": True, "message": "Profile picture updated.", "profile": profile}
+
+
+@app.delete("/api/profile/avatar")
+async def delete_my_avatar(request: Request):
+    username = current_username(request)
+    try:
+        profile = await run_in_threadpool(
+            profile_service.remove_avatar, username, client_ip(request)
+        )
+    except AuthError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail)
+    await broadcast_profile(username, profile)
+    return {"success": True, "message": "Profile picture removed.", "profile": profile}
+
+
 # --- Contact Management API Endpoints (ADDED FOR ISSUE #17) ---
 # --- Complete Friend Request & Contact Lifecycle Endpoints (UPDATED FOR ISSUE #17) ---
 class AddContactSchema(BaseModel):
