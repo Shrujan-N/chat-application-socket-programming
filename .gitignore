@@ -11,3 +11,5 @@ uploads/*
 .idea/
 .DS_Store
 Thumbs.db
+uploads/*
+!uploads/.gitkeep

@@ -1,7 +1,8 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 import os
+import shutil
 from database import init_db
 from pydantic import BaseModel
 from typing import Dict
@@ -201,3 +202,21 @@ async def get_chat_history(user1: str, user2: str):
     rows = cursor.fetchall()
     conn.close()
     return {"history": [dict(row) for row in rows]}
+
+# --- File & Image Attachment Multipart Upload Endpoint (ADDED FOR ISSUE #29) ---
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    if not os.path.exists("uploads"):
+        os.makedirs("uploads")
+        
+    file_location = f"uploads/{file.filename}"
+    with open(file_location, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    file_url = f"/uploads/{file.filename}"
+    return {
+        "success": True, 
+        "file_url": file_url, 
+        "filename": file.filename,
+        "content_type": file.content_type
+    }
