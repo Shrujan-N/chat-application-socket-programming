@@ -54,9 +54,10 @@
     </div>
 
     <!-- Image Preview Lightbox Modal (ADDED FOR ISSUE #29 ENHANCEMENT) -->
-    <div id="image-modal" style="display:none; position:fixed; z-index:9999; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.85); justify-content:center; align-items:center; cursor:pointer;" onclick="closeModal()">
-        <span style="position:absolute; top:20px; right:30px; font-size:35px; color:#fff; font-weight:bold;">&times;</span>
-        <img id="modal-img" src="" style="max-width:90%; max-height:90%; border-radius:8px; box-shadow:0 0 25px rgba(0,0,0,0.9); object-fit:contain;">
+    <!-- High Z-Index Isolated Lightbox Modal (FIXED FOR ISSUE #29) -->
+    <div id="image-modal" onclick="closeModal(event)" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.92); z-index:999999; justify-content:center; align-items:center; cursor:pointer;">
+        <span onclick="closeModal(event)" style="position:absolute; top:20px; right:30px; font-size:40px; color:#ffffff; font-weight:bold; cursor:pointer; z-index:1000000; user-select:none;">&times;</span>
+        <img id="modal-img" src="" onclick="event.stopPropagation()" style="max-width:90vw; max-height:90vh; border-radius:8px; box-shadow:0 0 30px rgba(0,0,0,0.95); object-fit:contain; cursor:default;">
     </div>
 
     <script>
@@ -296,17 +297,35 @@
         }
 
         // --- Multipart File & Image Upload Engine (UPDATED FOR ISSUE #29) ---
-        // --- Lightbox Modal View Functions (ADDED FOR ISSUE #29 ENHANCEMENT) ---
-        function openModal(src) {
+        // --- Global Scope Lightbox Modal Functions (FIXED FOR ISSUE #29) ---
+        window.openModal = function(src) {
+            if (!src) return;
             const modal = document.getElementById('image-modal');
             const modalImg = document.getElementById('modal-img');
             modalImg.src = src;
             modal.style.display = 'flex';
-        }
+        };
 
-        function closeModal() {
-            document.getElementById('image-modal').style.display = 'none';
-        }
+        window.closeModal = function(e) {
+            if (e) {
+                e.preventDefault();
+                e.stopPropagation();
+            }
+            const modal = document.getElementById('image-modal');
+            const modalImg = document.getElementById('modal-img');
+            modal.style.display = 'none';
+            modalImg.src = '';
+        };
+
+        // --- Global Document-Level Click Interceptor (PREVENTS EVENT BUBBLING & STATE RESET) ---
+        document.addEventListener('click', function(e) {
+            const imgTarget = e.target.closest('#messages-list img');
+            if (imgTarget) {
+                e.preventDefault();
+                e.stopPropagation(); // Stops click from resetting activeContact or refreshing UI
+                window.openModal(imgTarget.src);
+            }
+        }, true);
 
         // --- Refactored Drag & Drop + File Upload Engine (UPDATED FOR ISSUE #29) ---
         async function uploadFile(droppedFile = null) {
@@ -339,7 +358,8 @@
                     let formattedContent = "";
 
                     if (isImage) {
-                        formattedContent = `<div style="margin-top:4px;"><img src="${result.file_url}" alt="${result.filename}" onclick="openModal('${result.file_url}')" style="max-width:280px; max-height:280px; border-radius:8px; display:block; border:1px solid #2e3b52; cursor:pointer; transition: transform 0.2s;" onmouseover="this.style.transform='scale(1.02)'" onmouseout="this.style.transform='scale(1)'" title="Click to view full image"></div>`;
+                        // Pure HTML img element without fragile inline onclick handlers
+                        formattedContent = `<div style="margin-top:4px;"><img src="${result.file_url}" alt="${result.filename}" style="max-width:260px; max-height:260px; border-radius:8px; display:block; border:1px solid #2e3b52; cursor:pointer;" title="Click to expand"></div>`;
                     } else {
                         formattedContent = `<div style="margin-top:4px;"><a href="${result.file_url}" target="_blank" download="${result.filename}" style="color:#53bdeb; text-decoration:underline; font-weight:bold;">📎 Download ${result.filename}</a></div>`;
                     }
@@ -366,6 +386,17 @@
             } finally {
                 fileInput.value = '';
             }
+        }
+
+        // --- Global Chat Image Event Delegation (ADDED TO FIX BLANK MODAL & BUBBLING) ---
+        function initImageEventDelegation() {
+            const messagesList = document.getElementById('messages-list');
+            messagesList.addEventListener('click', function(e) {
+                if (e.target && e.target.tagName === 'IMG') {
+                    e.stopPropagation(); // Stop event from resetting activeContact or reloading state
+                    openModal(e.target.src); // Open full-resolution image source
+                }
+            });
         }
 
         // --- Drag and Drop Event Listeners (ADDED FOR ISSUE #29 ENHANCEMENT) ---
@@ -400,7 +431,8 @@
             loadUsersDropdown();
             initWebSocket();
             loadContacts();
-            initDragAndDrop(); // Initialize Drag and Drop listener
+            initDragAndDrop();
+            initImageEventDelegation(); // Initialize image event delegation
         };
     </script>
 </body>
