@@ -82,6 +82,20 @@ def visible_message(row, username):
         m["content"] = "This message was deleted."
     m["edited"] = bool(m["edited"])
     m["deleted_everyone"] = bool(m["deleted_everyone"])
+    if m.get("sender") == username:
+        with get_db() as db:
+            receipts = db.execute(
+                "SELECT delivered_at, read_at FROM message_receipts WHERE msg_id=?",
+                (m["msg_id"],),
+            ).fetchall()
+        if not receipts:
+            m["status"] = "sent"
+        elif all(r["read_at"] for r in receipts):
+            m["status"] = "read"
+        elif all(r["delivered_at"] for r in receipts):
+            m["status"] = "delivered"
+        else:
+            m["status"] = "sent"
     return m
 
 @app.get("/", response_class=HTMLResponse)
@@ -172,7 +186,7 @@ class CreateGroup(BaseModel):
     creator: str
     name: str = Field(min_length=1, max_length=80)
     icon: str = Field(default="👥", max_length=12)
-    members: list[str] = []
+    members: list[str] = Field(default_factory=list)
 
 @app.post("/api/groups")
 async def create_group(p: CreateGroup):
@@ -261,16 +275,31 @@ async def demote_admin(group_id: str,target: str,username: str):
         group=db.execute("SELECT creator FROM groups WHERE group_id=?",(group_id,)).fetchone()
         if not group: raise HTTPException(404,"Group not found.")
         if target==group["creator"]: raise HTTPException(400,"Creator must remain admin.")
-        db.execute("UPDATE group_members SET role='member' WHERE group_id=? AND username=?",(group_id,target))
+        cur = db.execute("UPDATE group_members SET role='member' WHERE group_id=? AND username=? AND role='admin'",(group_id,target))
+        if not cur.rowcount:
+            raise HTTPException(404, "Group admin not found.")
     await manager.many(members(group_id),{"type":"groups_changed"})
     return {"success":True}
 
 @app.get("/api/messages/history/{user1}/{user2}")
-async def private_history(user1: str,user2: str):
+async def private_history(user1: str, user2: str):
+    if user1 == user2:
+        raise HTTPException(400, "Choose another user.")
     with get_db() as db:
-        rows=db.execute("SELECT * FROM messages WHERE conversation_type='private' AND conversation_id=? ORDER BY rowid",
-                        (private_id(user1,user2),)).fetchall()
-    return {"history":[m for row in rows if (m:=visible_message(row,user1)) is not None]}
+        for username in (user1, user2):
+            if not db.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+                raise HTTPException(404, "User not found.")
+        accepted = db.execute(
+            "SELECT 1 FROM contacts WHERE user_id=? AND contact_id=? AND status='accepted'",
+            (user1, user2),
+        ).fetchone()
+        if not accepted:
+            raise HTTPException(403, "You can only view history with an accepted contact.")
+        rows = db.execute(
+            "SELECT * FROM messages WHERE conversation_type='private' AND conversation_id=? ORDER BY rowid",
+            (private_id(user1, user2),),
+        ).fetchall()
+    return {"history": [m for row in rows if (m := visible_message(row, user1)) is not None]}
 
 @app.get("/api/groups/{group_id}/history")
 async def group_history(group_id: str,username: str):
@@ -285,16 +314,38 @@ async def search(username: str,q: str):
     term="%"+q.strip()+"%"
     if not q.strip(): return {"contacts":[],"messages":[]}
     with get_db() as db:
-        c=db.execute("SELECT contact_id FROM contacts WHERE user_id=? AND status='accepted' AND contact_id LIKE=?",(username,term)).fetchall()
-        rows=db.execute("SELECT * FROM messages WHERE (sender=? OR recipient=? OR group_id IN (SELECT group_id FROM group_members WHERE username=?)) AND content LIKE ? ORDER BY rowid DESC LIMIT 100",
-                        (username,username,username,term)).fetchall()
+        c=db.execute("SELECT contact_id FROM contacts WHERE user_id=? AND status='accepted' AND contact_id LIKE ?",(username,term)).fetchall()
+        rows=db.execute("""SELECT * FROM messages
+          WHERE content LIKE ? AND (
+            (conversation_type='private' AND (sender=? OR recipient=?) AND EXISTS (
+              SELECT 1 FROM contacts c WHERE c.user_id=?
+                AND c.contact_id=CASE WHEN sender=? THEN recipient ELSE sender END
+                AND c.status='accepted'))
+            OR (conversation_type='group' AND group_id IN
+              (SELECT group_id FROM group_members WHERE username=?)))
+          ORDER BY rowid DESC LIMIT 100""",
+          (term, username, username, username, username, username)).fetchall()
     return {"contacts":[r["contact_id"] for r in c],"messages":[m for row in rows if (m:=visible_message(row,username)) is not None]}
 
 @app.post("/api/upload")
 async def upload(file: UploadFile=File(...)):
-    filename=Path(file.filename or "attachment.bin").name
-    safe=f"{uuid.uuid4().hex}_{filename}"
-    with (UPLOADS/safe).open("wb") as dest: shutil.copyfileobj(file.file,dest)
+    raw_filename = (file.filename or "attachment.bin").replace("\\", "/")
+    filename = Path(raw_filename).name or "attachment.bin"
+    safe = f"{uuid.uuid4().hex}_{filename}"
+    destination = UPLOADS / safe
+    size = 0
+    try:
+        with destination.open("wb") as dest:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > 10 * 1024 * 1024:
+                    raise HTTPException(413, "Files must be 10 MB or smaller.")
+                dest.write(chunk)
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
     return {"success":True,"filename":filename,"file_url":f"/uploads/{safe}","content_type":file.content_type}
 
 async def save_and_send(username,data):
@@ -305,7 +356,11 @@ async def save_and_send(username,data):
     gid=data.get("group_id")
     recipient=data.get("recipient")
     if gid:
-        require_member(gid,username)
+        try:
+            require_member(gid,username)
+        except HTTPException:
+            await manager.send(username, {"type":"error", "message":"You are not a member of this group."})
+            return
         targets=set(members(gid))-{username}
         kind,cid="group",gid
     else:
@@ -317,6 +372,9 @@ async def save_and_send(username,data):
             return
         targets={recipient};kind,cid="private",private_id(username,recipient)
     with get_db() as db:
+        if db.execute("SELECT 1 FROM messages WHERE msg_id=?", (msg_id,)).fetchone():
+            await manager.send(username, {"type": "error", "message": "Duplicate message ID; message was not sent."})
+            return
         db.execute("""INSERT INTO messages(msg_id,conversation_type,conversation_id,sender,recipient,group_id,content,timestamp)
                       VALUES(?,?,?,?,?,?,?,?)""",(msg_id,kind,cid,username,recipient,gid,content,timestamp))
         for target in targets:
@@ -337,15 +395,18 @@ async def deliver_pending(username):
         with get_db() as db:
             hidden=db.execute("SELECT 1 FROM user_message_deletions WHERE msg_id=? AND username=?",(row["msg_id"],username)).fetchone()
         if hidden: continue
-        await manager.send(username,{"type":"receive_message","msg_id":row["msg_id"],"sender":row["sender"],
+        delivered = await manager.send(username,{"type":"receive_message","msg_id":row["msg_id"],"sender":row["sender"],
           "recipient":row["recipient"],"group_id":row["group_id"],"conversation_type":row["conversation_type"],
           "conversation_id":row["conversation_id"],"content":row["content"],"timestamp":row["timestamp"],"edited":bool(row["edited"])})
-        with get_db() as db: db.execute("UPDATE message_receipts SET delivered_at=? WHERE msg_id=? AND username=?",(now(),row["msg_id"],username))
-        await manager.send(row["sender"],{"type":"status_update","msg_id":row["msg_id"],"username":username,"status":"delivered"})
+        if delivered:
+            with get_db() as db: db.execute("UPDATE message_receipts SET delivered_at=? WHERE msg_id=? AND username=?",(now(),row["msg_id"],username))
+            await manager.send(row["sender"],{"type":"status_update","msg_id":row["msg_id"],"username":username,"status":"delivered"})
 
 async def edit_message(username,data):
     mid=str(data.get("msg_id","")); content=str(data.get("content","")).strip()
-    if not mid or not content:return
+    if not mid or not content:
+        await manager.send(username, {"type":"error", "message":"A message ID and non-empty content are required."})
+        return
     with get_db() as db:
         row=db.execute("SELECT * FROM messages WHERE msg_id=?",(mid,)).fetchone()
         if not row or row["sender"]!=username or row["deleted_everyone"]:
@@ -356,7 +417,9 @@ async def edit_message(username,data):
 
 async def delete_message(username,data):
     mid=str(data.get("msg_id",""));scope=data.get("scope","me")
-    if scope not in ("me","everyone"):return
+    if scope not in ("me","everyone"):
+        await manager.send(username, {"type":"error", "message":"Delete scope must be 'me' or 'everyone'."})
+        return
     with get_db() as db:
         row=db.execute("SELECT * FROM messages WHERE msg_id=?",(mid,)).fetchone()
         if not row:
@@ -396,12 +459,31 @@ async def websocket_endpoint(ws: WebSocket,username: str):
             elif kind in ("typing","stop_typing"):
                 gid=data.get("group_id");recipient=data.get("recipient")
                 if gid:
-                    try: targets=set(members(gid))-{username}; require_member(gid,username)
-                    except HTTPException: continue
-                else: targets={recipient} if recipient else set()
+                    try:
+                        require_member(gid, username)
+                        targets=set(members(gid))-{username}
+                    except HTTPException:
+                        await manager.send(username, {"type":"error", "message":"You are not a member of this group."})
+                        continue
+                else:
+                    if not recipient or recipient == username:
+                        continue
+                    with get_db() as db:
+                        accepted = db.execute(
+                            "SELECT 1 FROM contacts WHERE user_id=? AND contact_id=? AND status='accepted'",
+                            (username, recipient),
+                        ).fetchone()
+                    if not accepted:
+                        await manager.send(username, {"type":"error", "message":"Typing indicators are only available to accepted contacts."})
+                        continue
+                    targets={recipient}
                 await manager.many(targets,{"type":kind,"username":username,"group_id":gid,"recipient":recipient})
             elif kind=="edit_message": await edit_message(username,data)
             elif kind=="delete_message": await delete_message(username,data)
             elif kind=="read_ack": await read_ack(username,data)
     except WebSocketDisconnect:
         await manager.disconnect(username,ws)
+    except (HTTPException, ValueError, TypeError) as exc:
+        await manager.send(username, {"type":"error", "message": str(getattr(exc, "detail", exc))})
+    finally:
+        await manager.disconnect(username, ws)

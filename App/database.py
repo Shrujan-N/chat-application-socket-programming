@@ -1,7 +1,8 @@
+import os
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent / "chat_app.db"
+DB_PATH = Path(os.environ.get("CHAT_DB_PATH", Path(__file__).resolve().parent / "chat_app.db")).resolve()
 
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=10)
