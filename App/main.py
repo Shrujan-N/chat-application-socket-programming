@@ -220,3 +220,32 @@ async def upload_file(file: UploadFile = File(...)):
         "filename": file.filename,
         "content_type": file.content_type
     }
+
+# --- Full-Text Search API Endpoint (ADDED FOR ISSUE #31) ---
+@app.get("/api/search")
+async def search_query(username: str, q: str):
+    if not q or len(q.strip()) == 0:
+        return {"contacts": [], "messages": []}
+
+    search_term = f"%{q.strip()}%"
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # 1. Search Contacts matching search term
+    cursor.execute("""
+        SELECT contact_id FROM contacts 
+        WHERE user_id = ? AND status = 'accepted' AND contact_id LIKE ?
+    """, (username, search_term))
+    contacts = [row["contact_id"] for row in cursor.fetchall()]
+
+    # 2. Search Messages matching content search term
+    cursor.execute("""
+        SELECT msg_id, sender, recipient, content, timestamp 
+        FROM messages 
+        WHERE (sender = ? OR recipient = ?) AND content LIKE ?
+        ORDER BY id DESC
+    """, (username, username, search_term))
+    messages = [dict(row) for row in cursor.fetchall()]
+
+    conn.close()
+    return {"contacts": contacts, "messages": messages}
