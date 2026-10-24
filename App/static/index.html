@@ -52,6 +52,13 @@
             <button onclick="sendMessage()">Send</button>
         </div>
     </div>
+
+    <!-- Image Preview Lightbox Modal (ADDED FOR ISSUE #29 ENHANCEMENT) -->
+    <div id="image-modal" style="display:none; position:fixed; z-index:9999; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.85); justify-content:center; align-items:center; cursor:pointer;" onclick="closeModal()">
+        <span style="position:absolute; top:20px; right:30px; font-size:35px; color:#fff; font-weight:bold;">&times;</span>
+        <img id="modal-img" src="" style="max-width:90%; max-height:90%; border-radius:8px; box-shadow:0 0 25px rgba(0,0,0,0.9); object-fit:contain;">
+    </div>
+
     <script>
         let currentUser = "shrujan";
         let activeContact = null;
@@ -288,12 +295,112 @@
             list.scrollTop = list.scrollHeight;
         }
 
-        function uploadFile() {}
+        // --- Multipart File & Image Upload Engine (UPDATED FOR ISSUE #29) ---
+        // --- Lightbox Modal View Functions (ADDED FOR ISSUE #29 ENHANCEMENT) ---
+        function openModal(src) {
+            const modal = document.getElementById('image-modal');
+            const modalImg = document.getElementById('modal-img');
+            modalImg.src = src;
+            modal.style.display = 'flex';
+        }
+
+        function closeModal() {
+            document.getElementById('image-modal').style.display = 'none';
+        }
+
+        // --- Refactored Drag & Drop + File Upload Engine (UPDATED FOR ISSUE #29) ---
+        async function uploadFile(droppedFile = null) {
+            const fileInput = document.getElementById('file-input');
+            let file = droppedFile;
+
+            if (!file) {
+                if (!fileInput.files || fileInput.files.length === 0) return;
+                file = fileInput.files[0];
+            }
+            
+            if (!activeContact) {
+                alert("Please select a contact before uploading files!");
+                fileInput.value = '';
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append("file", file);
+
+            try {
+                const response = await fetch('/api/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const result = await response.json();
+
+                if (result.success) {
+                    const isImage = file.type.startsWith('image/');
+                    let formattedContent = "";
+
+                    if (isImage) {
+                        formattedContent = `<div style="margin-top:4px;"><img src="${result.file_url}" alt="${result.filename}" onclick="openModal('${result.file_url}')" style="max-width:280px; max-height:280px; border-radius:8px; display:block; border:1px solid #2e3b52; cursor:pointer; transition: transform 0.2s;" onmouseover="this.style.transform='scale(1.02)'" onmouseout="this.style.transform='scale(1)'" title="Click to view full image"></div>`;
+                    } else {
+                        formattedContent = `<div style="margin-top:4px;"><a href="${result.file_url}" target="_blank" download="${result.filename}" style="color:#53bdeb; text-decoration:underline; font-weight:bold;">📎 Download ${result.filename}</a></div>`;
+                    }
+
+                    const msgId = 'msg-' + Date.now();
+                    const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                    const payload = {
+                        type: "send_message",
+                        msg_id: msgId,
+                        sender: currentUser,
+                        recipient: activeContact,
+                        content: formattedContent,
+                        timestamp: timeStr
+                    };
+
+                    ws.send(JSON.stringify(payload));
+                    appendMessageUI(currentUser, formattedContent, timeStr, 'sent', msgId);
+                } else {
+                    alert("File upload failed!");
+                }
+            } catch (err) {
+                console.error("Upload error:", err);
+                alert("Error uploading file to server.");
+            } finally {
+                fileInput.value = '';
+            }
+        }
+
+        // --- Drag and Drop Event Listeners (ADDED FOR ISSUE #29 ENHANCEMENT) ---
+        function initDragAndDrop() {
+            const chatArea = document.getElementById('chat-area');
+
+            chatArea.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                chatArea.style.outline = '2px dashed #007bff';
+                chatArea.style.outlineOffset = '-10px';
+                chatArea.style.background = '#141c2b';
+            });
+
+            chatArea.addEventListener('dragleave', (e) => {
+                e.preventDefault();
+                chatArea.style.outline = 'none';
+                chatArea.style.background = '#0f141d';
+            });
+
+            chatArea.addEventListener('drop', (e) => {
+                e.preventDefault();
+                chatArea.style.outline = 'none';
+                chatArea.style.background = '#0f141d';
+
+                if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                    uploadFile(e.dataTransfer.files[0]);
+                }
+            });
+        }
 
         window.onload = function() {
             loadUsersDropdown();
             initWebSocket();
             loadContacts();
+            initDragAndDrop(); // Initialize Drag and Drop listener
         };
     </script>
 </body>
