@@ -1,5 +1,6 @@
-
+import getpass
 import json
+import os
 import socket
 import threading
 import uuid
@@ -15,6 +16,60 @@ send_lock = threading.Lock()
 typing_lock = threading.Lock()
 typing_timer = None
 is_typing = False
+session_token = None
+session_user = None
+
+# FR-03: the session is saved here so closing and reopening the client within
+# the session validity window returns the user to their account.
+SESSION_FILE = os.environ.get(
+    "CHAT_SESSION_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".chat_session")
+)
+session_file_lock = threading.Lock()
+
+
+def save_session(username, token):
+    """Remember the session token on disk (owner-only permissions)."""
+    global session_token, session_user
+
+    session_token = token
+    session_user = username
+
+    if not username or not token:
+        return
+
+    try:
+        with session_file_lock:
+            fd = os.open(SESSION_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"username": username, "token": token}, f)
+    except OSError:
+        pass  # not being able to save only means the user logs in next time
+
+
+def load_session():
+    try:
+        with open(SESSION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("token") and data.get("username"):
+            return data
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def clear_session():
+    """Forget the saved session (logout, or the server rejected it)."""
+    global session_token, session_user
+
+    session_token = None
+    session_user = None
+
+    try:
+        with session_file_lock:
+            os.remove(SESSION_FILE)
+    except OSError:
+        pass
 
 
 def send_event(client, event):
@@ -145,6 +200,15 @@ def receive_messages(reader, client, stop_event):
                     except OSError:
                         pass
 
+            elif event_type == "session":
+                # Sliding session: server issued a fresh token while we are active.
+                save_session(session_user, event.get("token"))
+
+            elif event_type == "logged_out":
+                clear_session()
+                print(f"\n{event.get('message', 'You have been logged out.')}")
+                break
+
             elif event_type == "message_edit":
                 message_id = event.get("message_id", "")
                 sender = event.get("sender", "Unknown")
@@ -218,6 +282,7 @@ def is_command(message):
         "/back",
         "/groups",
         "/quit",
+        "/logout",
         "/help",
         "/group-help"
     }
@@ -252,7 +317,8 @@ def print_help():
     print("/delete message_id me             Delete a message from your view")
     print("/delete message_id everyone       Delete your message for everyone")
     print("/help                             Show commands")
-    print("/quit                             Disconnect")
+    print("/quit                             Disconnect (you stay logged in)")
+    print("/logout                           Log out and forget the saved session")
 
     print("\n--- Group Management ---")
     print("/group-info name                  View group details")
@@ -263,6 +329,122 @@ def print_help():
     print("/group-admin name username        Make a member an admin")
     print("/group-admin-remove name username Remove an admin role")
     print("/group-help                       Show group management help")
+
+
+def read_event(reader):
+    """Read one JSON line from the server; None means the connection closed."""
+    line = reader.readline()
+
+    if not line:
+        return None
+
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return {"type": "text", "message": line.strip()}
+
+
+def try_resume(client, reader):
+    """
+    Use the saved session token to return to the account without re-entering
+    credentials. Returns the username, or None if there is no valid session
+    (the saved session is then discarded and the normal login menu is shown).
+    """
+    saved = load_session()
+
+    if not saved:
+        return None
+
+    try:
+        send_event(client, {"type": "resume", "token": saved["token"]})
+    except OSError:
+        return None
+
+    result = read_event(reader)
+
+    if result is None:
+        return None
+
+    if (
+        result.get("type") == "auth_result"
+        and result.get("success")
+        and result.get("action") == "resume"
+    ):
+        save_session(result.get("username"), result.get("token"))
+        print(f"Welcome back, {result.get('username')}! Your session was restored.")
+        return result.get("username")
+
+    clear_session()
+    print(
+        f"Saved session is no longer valid ({result.get('message', 'expired')}). "
+        "Please log in."
+    )
+    return None
+
+
+def authenticate(client, reader):
+    """
+    Registration / login menu. Registering returns to the menu so the user
+    logs in next. Returns the username once logged in, or None to exit.
+    """
+    global session_token
+
+    while True:
+        print("\n1) Log in")
+        print("2) Register")
+        print("3) Quit")
+
+        try:
+            choice = input("Choose an option: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            choice = "3"
+
+        if choice in ("3", "q", "quit"):
+            try:
+                send_event(client, {"type": "quit"})
+            except OSError:
+                pass
+            return None
+
+        if choice in ("2", "register"):
+            username = input("Username: ").strip()
+            email = input("Email: ").strip()
+            password = getpass.getpass("Password: ")
+            send_event(client, {
+                "type": "register",
+                "username": username,
+                "email": email,
+                "password": password
+            })
+
+        elif choice in ("1", "login", "log in"):
+            username = input("Username: ").strip()
+            password = getpass.getpass("Password: ")
+            send_event(client, {
+                "type": "login",
+                "username": username,
+                "password": password
+            })
+
+        else:
+            print("Invalid option. Enter 1, 2 or 3.")
+            continue
+
+        result = read_event(reader)
+
+        if result is None:
+            print("The server closed the connection.")
+            return None
+
+        print(result.get("message", result))
+
+        if (
+            result.get("type") == "auth_result"
+            and result.get("success")
+            and result.get("action") == "login"
+        ):
+            save_session(result.get("username"), result.get("token"))
+            return result.get("username")
 
 
 def start_client():
@@ -285,14 +467,15 @@ def start_client():
         initial_response = json.loads(initial_line)
         print(initial_response.get("message", initial_response))
 
-        username = input("Username: ").strip()
+        username = try_resume(client, reader)
 
         if not username:
-            print("Username cannot be empty.")
+            username = authenticate(client, reader)
+
+        if not username:
             return
 
-        client.sendall((username + "\n").encode("utf-8"))
-
+        # The server sends "Welcome, <name>!" or "ERROR: ..." next.
         response_line = reader.readline()
 
         if not response_line:
@@ -344,6 +527,19 @@ def start_client():
                 except OSError:
                     pass
 
+                break
+
+            if message.lower() == "/logout":
+                try:
+                    send_event(client, {
+                        "type": "command",
+                        "message": "/logout"
+                    })
+                except OSError:
+                    pass
+
+                clear_session()
+                print("You have been logged out.")
                 break
 
             if message == "/help":
