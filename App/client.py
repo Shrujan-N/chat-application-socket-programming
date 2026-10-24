@@ -1,4 +1,4 @@
-
+import getpass
 import json
 import socket
 import threading
@@ -15,6 +15,7 @@ send_lock = threading.Lock()
 typing_lock = threading.Lock()
 typing_timer = None
 is_typing = False
+session_token = None
 
 
 def send_event(client, event):
@@ -265,6 +266,84 @@ def print_help():
     print("/group-help                       Show group management help")
 
 
+def read_event(reader):
+    """Read one JSON line from the server; None means the connection closed."""
+    line = reader.readline()
+
+    if not line:
+        return None
+
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return {"type": "text", "message": line.strip()}
+
+
+def authenticate(client, reader):
+    """
+    Registration / login menu. Registering returns to the menu so the user
+    logs in next. Returns the username once logged in, or None to exit.
+    """
+    global session_token
+
+    while True:
+        print("\n1) Log in")
+        print("2) Register")
+        print("3) Quit")
+
+        try:
+            choice = input("Choose an option: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            choice = "3"
+
+        if choice in ("3", "q", "quit"):
+            try:
+                send_event(client, {"type": "quit"})
+            except OSError:
+                pass
+            return None
+
+        if choice in ("2", "register"):
+            username = input("Username: ").strip()
+            email = input("Email: ").strip()
+            password = getpass.getpass("Password: ")
+            send_event(client, {
+                "type": "register",
+                "username": username,
+                "email": email,
+                "password": password
+            })
+
+        elif choice in ("1", "login", "log in"):
+            username = input("Username: ").strip()
+            password = getpass.getpass("Password: ")
+            send_event(client, {
+                "type": "login",
+                "username": username,
+                "password": password
+            })
+
+        else:
+            print("Invalid option. Enter 1, 2 or 3.")
+            continue
+
+        result = read_event(reader)
+
+        if result is None:
+            print("The server closed the connection.")
+            return None
+
+        print(result.get("message", result))
+
+        if (
+            result.get("type") == "auth_result"
+            and result.get("success")
+            and result.get("action") == "login"
+        ):
+            session_token = result.get("token")
+            return result.get("username")
+
+
 def start_client():
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     reader = None
@@ -285,14 +364,12 @@ def start_client():
         initial_response = json.loads(initial_line)
         print(initial_response.get("message", initial_response))
 
-        username = input("Username: ").strip()
+        username = authenticate(client, reader)
 
         if not username:
-            print("Username cannot be empty.")
             return
 
-        client.sendall((username + "\n").encode("utf-8"))
-
+        # The server sends "Welcome, <name>!" or "ERROR: ..." next.
         response_line = reader.readline()
 
         if not response_line:

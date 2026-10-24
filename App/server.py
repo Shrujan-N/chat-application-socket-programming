@@ -1,11 +1,20 @@
-
 import json
 import socket
 import threading
 import uuid
 
+from database import init_db
+from security import SESSION_TIMEOUT_MINUTES
+from auth_service import (
+    AuthError, register_account, authenticate, record_event, user_exists
+)
+
 HOST = "127.0.0.1"
 PORT = 5000
+
+# Seconds a connection may stay unauthenticated, and max auth messages per connection.
+AUTH_TIMEOUT_SECONDS = 300
+MAX_AUTH_MESSAGES = 20
 
 clients = {}
 active_chats = {}
@@ -33,6 +42,92 @@ def send_text(connection, message):
         connection,
         {"type": "text", "message": message}
     )
+
+
+def send_auth_result(connection, success, action, message, **extra):
+    event = {
+        "type": "auth_result",
+        "success": success,
+        "action": action,
+        "message": message
+    }
+    event.update(extra)
+    return send_event(connection, event)
+
+
+def authenticate_connection(connection, reader, address):
+    """
+    Registration / login phase. The client sends one JSON event per line:
+      {"type": "register", "username": ..., "email": ..., "password": ...}
+      {"type": "login", "username": ..., "password": ...}
+      {"type": "quit"}
+    Returns the authenticated username, or None if the client leaves or
+    exceeds the allowed number of attempts.
+    """
+    send_text(connection, "Welcome! Please log in or register.")
+
+    for _ in range(MAX_AUTH_MESSAGES):
+        line = reader.readline()
+
+        if not line:
+            return None
+
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            event = None
+
+        if not isinstance(event, dict):
+            send_auth_result(connection, False, "error", "Invalid message format.")
+            continue
+
+        event_type = event.get("type")
+        username = event.get("username")
+        password = event.get("password")
+        username = username if isinstance(username, str) else ""
+        password = password if isinstance(password, str) else ""
+
+        try:
+            if event_type == "register":
+                email = event.get("email")
+                register_account(
+                    username,
+                    email if isinstance(email, str) else "",
+                    password
+                )
+                send_auth_result(
+                    connection, True, "register",
+                    "Registration successful. You can now log in."
+                )
+
+            elif event_type == "login":
+                ip = address[0] if address else None
+                result = authenticate(username, password, ip)
+                send_auth_result(
+                    connection, True, "login", "Login successful.",
+                    username=result["username"],
+                    token=result["token"],
+                    expires_in=result["expires_in"]
+                )
+                return result["username"]
+
+            elif event_type == "quit":
+                return None
+
+            else:
+                send_auth_result(
+                    connection, False, "error",
+                    "Please log in or register first."
+                )
+
+        except AuthError as error:
+            send_auth_result(
+                connection, False, event_type or "error", error.detail,
+                status=error.status_code
+            )
+
+    send_text(connection, "Too many attempts. Disconnecting.")
+    return None
 
 
 def send_status(username, message_id, status, message=None):
@@ -139,6 +234,9 @@ def group_management(connection, username, command):
 
         group_name, target = parts[1], parts[2]
 
+        # Registered accounts can be added even if they have not connected yet.
+        target_registered = user_exists(target)
+
         with clients_lock:
             group = find_group(group_name)
 
@@ -150,10 +248,10 @@ def group_management(connection, username, command):
                 send_text(connection, "Only group admins can add members.")
                 return True
 
-            if target not in clients and target not in user_groups:
+            if not target_registered:
                 send_text(
                     connection,
-                    "That user has not connected to the server before."
+                    "That user is not registered."
                 )
                 return True
 
@@ -860,6 +958,11 @@ def handle_command(connection, username, command):
             send_text(connection, "Enter another user's username.")
             return
 
+        # Accounts now come from registration, so the target must exist.
+        if not user_exists(target):
+            send_text(connection, f"User '{target}' is not registered.")
+            return
+
         with clients_lock:
             active_groups.pop(username, None)
             previous = active_chats.get(username)
@@ -927,8 +1030,10 @@ def handle_client(connection, address):
 
     try:
         reader = connection.makefile("r", encoding="utf-8")
-        send_text(connection, "Enter your username:")
-        username = reader.readline().strip()
+
+        # --- Registration / login phase ---
+        connection.settimeout(AUTH_TIMEOUT_SECONDS)
+        username = authenticate_connection(connection, reader, address)
 
         if not username:
             return
@@ -936,11 +1041,15 @@ def handle_client(connection, address):
         with clients_lock:
             if username in clients:
                 send_text(connection, "ERROR: Username already in use.")
+                username = None  # do not clean up the other session's state
                 return
 
             clients[username] = connection
             user_groups.setdefault(username, set())
             offline_messages.setdefault(username, [])
+
+        # Idle timeout: the session ends after SESSION_TIMEOUT_MINUTES without activity.
+        connection.settimeout(SESSION_TIMEOUT_MINUTES * 60)
 
         send_text(connection, f"Welcome, {username}!")
         print(f"{username} is now online.")
@@ -1004,6 +1113,16 @@ def handle_client(connection, address):
                 except ConnectionAbortedError:
                     break
 
+    except socket.timeout:
+        if username:
+            send_text(
+                connection,
+                "Session expired due to inactivity. Please log in again."
+            )
+        else:
+            send_text(connection, "Login timed out. Please reconnect.")
+        print(f"Timed out: {username or address}")
+
     except (ConnectionResetError, OSError, ValueError) as error:
         print(f"Connection error for {username or address}: {error}")
 
@@ -1020,6 +1139,12 @@ def handle_client(connection, address):
 
                 active_groups.pop(username, None)
 
+        if username:
+            try:
+                record_event(username, "logout", True, address[0] if address else None)
+            except Exception as error:
+                print(f"Could not log logout for {username}: {error}")
+
         if reader:
             try:
                 reader.close()
@@ -1035,6 +1160,8 @@ def handle_client(connection, address):
 
 
 def start_server():
+    init_db()
+
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
