@@ -24,17 +24,119 @@
         button { padding: 10px 18px; border: none; background: #007bff; color: white; border-radius: 6px; cursor: pointer; font-weight: bold; }
         button:hover { background: #0056b3; }
         .search-box { padding: 10px; background: #1a2332; border-bottom: 1px solid #2e3b52; }
+        #add-contact-dialog { width: min(400px, calc(100% - 32px)); margin: auto; padding: 20px; border: 1px solid #2e3b52; border-radius: 8px; background: #1a2332; color: #fff; }
+        #add-contact-dialog::backdrop { background: rgba(0, 0, 0, 0.7); }
+        #add-contact-form { display: flex; flex-direction: column; gap: 12px; }
+        #add-contact-form input { padding: 10px; border: 1px solid #2e3b52; border-radius: 6px; background: #0f141d; color: #fff; }
+        #add-contact-actions { display: flex; justify-content: flex-end; gap: 8px; }
+        #add-contact-error { color: #ff8080; font-size: 13px; }
+ 
+        /* --- Profiles (FR-05) --- */
+        .avatar { border-radius: 50%; object-fit: cover; background: #2c3a52; flex: none; display: inline-flex; align-items: center; justify-content: center; color: #fff; font-weight: bold; overflow: hidden; }
+        .contact-main { flex: 1; display: flex; align-items: center; gap: 10px; min-width: 0; }
+        .contact-text { display: flex; flex-direction: column; min-width: 0; }
+        .contact-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .contact-bio { font-size: 11px; color: #8696a0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .contact-item.active .contact-bio { color: #dbe9ff; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        #current-user-label { max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
+        #own-avatar { cursor: pointer; display: inline-flex; }
+        #profile-dialog { width: min(420px, calc(100% - 32px)); margin: auto; padding: 20px; border: 1px solid #2e3b52; border-radius: 8px; background: #1a2332; color: #fff; }
+        #profile-dialog::backdrop { background: rgba(0, 0, 0, 0.7); }
+        #profile-picture-row { display: flex; align-items: center; gap: 16px; margin-bottom: 6px; }
+        #profile-picture-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+        #profile-picture-actions .hint { flex-basis: 100%; }
+        #profile-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+
+        /* --- Login / Registration screen --- */
+        #auth-screen { position: fixed; inset: 0; z-index: 2000; background: #121826; display: flex; align-items: center; justify-content: center; padding: 16px; }
+        #auth-screen[hidden] { display: none; }
+        .auth-card { width: min(400px, 100%); background: #1a2332; border: 1px solid #2e3b52; border-radius: 10px; padding: 28px; }
+        .auth-card h1 { font-size: 22px; margin-bottom: 18px; }
+        .auth-tabs { display: flex; gap: 8px; margin-bottom: 18px; }
+        .auth-tabs button { flex: 1; background: #232d3f; }
+        .auth-tabs button.active { background: #007bff; }
+        .auth-form { display: flex; flex-direction: column; gap: 6px; }
+        .auth-form[hidden] { display: none; }
+        .auth-form label { font-size: 13px; color: #8696a0; margin-top: 6px; }
+        .auth-form input { padding: 10px; border: 1px solid #2e3b52; border-radius: 6px; background: #0f141d; color: #fff; outline: none; }
+        .auth-form input:focus { border-color: #007bff; }
+        .auth-form .primary { margin-top: 14px; }
+        .auth-error { color: #ff8080; font-size: 13px; margin-top: 8px; }
+        .auth-info { color: #5fd38d; font-size: 13px; margin-top: 8px; }
+        .hint { font-size: 12px; color: #8696a0; }
+        .link-btn { background: none; border: none; padding: 0; color: #53bdeb; font-weight: normal; font-size: 13px; text-decoration: underline; cursor: pointer; }
+        .link-btn:hover { background: none; color: #8fd3f4; }
+        .auth-form .secondary { background: #232d3f; margin-top: 8px; }
     </style>
 </head>
 <body>
+    <!-- Login / Registration -->
+    <div id="auth-screen">
+        <div class="auth-card">
+            <h1>Chat App</h1>
+            <div class="auth-tabs">
+                <button type="button" id="tab-login" class="active" onclick="showAuthTab('login')">Log in</button>
+                <button type="button" id="tab-register" onclick="showAuthTab('register')">Register</button>
+            </div>
+ 
+            <form id="login-form" class="auth-form" onsubmit="handleLogin(event)" novalidate>
+                <label for="login-username">Username</label>
+                <input id="login-username" type="text" autocomplete="username">
+                <label for="login-password">Password</label>
+                <input id="login-password" type="password" autocomplete="current-password">
+                <p id="login-info" class="auth-info" role="status" hidden></p>
+                <p id="login-error" class="auth-error" role="alert" hidden></p>
+                <button id="login-submit" class="primary" type="submit">Log in</button>
+                <p class="hint" style="margin-top:10px;"><button type="button" class="link-btn" onclick="showForgot()">Forgot password?</button></p>
+            </form>
+ 
+            <form id="register-form" class="auth-form" onsubmit="handleRegister(event)" novalidate hidden>
+                <label for="register-username">Username</label>
+                <input id="register-username" type="text" autocomplete="username">
+                <label for="register-email">Email</label>
+                <input id="register-email" type="text" autocomplete="email">
+                <label for="register-password">Password</label>
+                <input id="register-password" type="password" autocomplete="new-password">
+                <p class="hint">At least 8 characters with upper-case, lower-case and a number.</p>
+                <p id="register-error" class="auth-error" role="alert" hidden></p>
+                <button id="register-submit" class="primary" type="submit">Register</button>
+            </form>
+ 
+            <!-- Password recovery (FR-04): request a reset link -->
+            <form id="forgot-form" class="auth-form" onsubmit="handleForgot(event)" novalidate hidden>
+                <p class="hint">Enter your registered email and we will send you a reset link.</p>
+                <label for="forgot-email">Email</label>
+                <input id="forgot-email" type="text" autocomplete="email">
+                <p id="forgot-info" class="auth-info" role="status" hidden></p>
+                <p id="forgot-error" class="auth-error" role="alert" hidden></p>
+                <button id="forgot-submit" class="primary" type="submit">Send reset link</button>
+                <button type="button" class="secondary" onclick="showAuthTab('login')">Back to log in</button>
+            </form>
+ 
+            <!-- Password recovery (FR-04): choose a new password from the emailed link -->
+            <form id="reset-form" class="auth-form" onsubmit="handleReset(event)" novalidate hidden>
+                <p class="hint">Choose a new password for your account.</p>
+                <label for="reset-password">New password</label>
+                <input id="reset-password" type="password" autocomplete="new-password">
+                <label for="reset-confirm">Confirm new password</label>
+                <input id="reset-confirm" type="password" autocomplete="new-password">
+                <p class="hint">At least 8 characters with upper-case, lower-case and a number.</p>
+                <p id="reset-error" class="auth-error" role="alert" hidden></p>
+                <button id="reset-submit" class="primary" type="submit">Reset password</button>
+            </form>
+        </div>
+    </div>
+ 
     <div id="sidebar">
         <div class="header">
-            <div style="display:flex; align-items:center; gap:5px;">
-                <span style="font-size:13px;">User:</span>
-                <select id="user-select" onchange="switchAccount(this.value)" style="padding:4px 8px; background:#0f141d; color:#fff; border:1px solid #2e3b52; border-radius:4px; outline:none; font-weight:bold; cursor:pointer;">
-                </select>
+            <div style="display:flex; align-items:center; gap:8px;">
+                <span id="own-avatar" onclick="openProfileDialog()" title="Edit your profile"></span>
+                <span style="font-size:13px;"><b id="current-user-label"></b></span>
+                <button onclick="openProfileDialog()" style="padding: 4px 8px; font-size: 11px;">Profile</button>
+                <button onclick="logout()" style="padding: 4px 8px; font-size: 11px; background: #dc3545;">Logout</button>
             </div>
-            <button onclick="addContactPrompt()" style="padding: 5px 10px; font-size: 12px; background: #28a745;">+ Add</button>
+            <button onclick="openAddContactDialog()" style="padding: 5px 10px; font-size: 12px; background: #28a745;">+ Add</button>
         </div>
         <div class="search-box">
             <input type="text" id="global-search" placeholder="Search contacts or messages..." onkeyup="handleSearch()">
@@ -52,93 +154,621 @@
             <button onclick="sendMessage()">Send</button>
         </div>
     </div>
+ 
+    <dialog id="add-contact-dialog">
+        <form id="add-contact-form" onsubmit="addContact(event)">
+            <h2>Add a contact</h2>
+            <label for="add-contact-username">Username</label>
+            <input id="add-contact-username" type="text" autocomplete="off" required>
+            <p id="add-contact-error" role="alert" hidden></p>
+            <div id="add-contact-actions">
+                <button type="button" onclick="closeAddContactDialog()">Cancel</button>
+                <button id="add-contact-submit" type="submit" style="background:#28a745;">Add</button>
+            </div>
+        </form>
+    </dialog>
+ 
+    <!-- Profile management (FR-05) -->
+    <dialog id="profile-dialog">
+        <form id="profile-form" class="auth-form" onsubmit="saveProfile(event)" novalidate>
+            <h2>Your profile</h2>
+            <div id="profile-picture-row">
+                <span id="profile-avatar-preview"></span>
+                <div id="profile-picture-actions">
+                    <input type="file" id="profile-avatar-input" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none;" onchange="uploadAvatar()">
+                    <button type="button" onclick="document.getElementById('profile-avatar-input').click()">Upload picture</button>
+                    <button type="button" id="profile-remove-avatar" onclick="removeAvatar()" style="background:#dc3545;">Remove picture</button>
+                    <p class="hint">PNG, JPEG, GIF or WebP, up to 2 MB.</p>
+                </div>
+            </div>
+            <label for="profile-display-name">Display name</label>
+            <input id="profile-display-name" type="text" autocomplete="off">
+            <p class="hint">Up to 50 characters: letters, numbers, spaces and . _ ' -</p>
+            <label for="profile-bio">Status</label>
+            <input id="profile-bio" type="text" autocomplete="off" oninput="updateBioCounter()">
+            <p class="hint" id="profile-bio-count">0/150</p>
+            <p id="profile-info" class="auth-info" role="status" hidden></p>
+            <p id="profile-error" class="auth-error" role="alert" hidden></p>
+            <div id="profile-actions">
+                <button type="button" onclick="closeProfileDialog()">Close</button>
+                <button id="profile-save" type="submit" style="background:#28a745;">Save changes</button>
+            </div>
+        </form>
+    </dialog>
 
-    <!-- Image Preview Lightbox Modal (ADDED FOR ISSUE #29 ENHANCEMENT) -->
     <!-- High Z-Index Isolated Lightbox Modal (FIXED FOR ISSUE #29) -->
     <div id="image-modal" onclick="closeModal(event)" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.92); z-index:999999; justify-content:center; align-items:center; cursor:pointer;">
         <span onclick="closeModal(event)" style="position:absolute; top:20px; right:30px; font-size:40px; color:#ffffff; font-weight:bold; cursor:pointer; z-index:1000000; user-select:none;">&times;</span>
         <img id="modal-img" src="" onclick="event.stopPropagation()" style="max-width:90vw; max-height:90vh; border-radius:8px; box-shadow:0 0 30px rgba(0,0,0,0.95); object-fit:contain; cursor:default;">
     </div>
-
+ 
     <script>
-        let currentUser = "shrujan";
+        let currentUser = null;
         let activeContact = null;
         let ws = null;
-
+ 
+        // ================= Authentication & session handling =================
+        const TOKEN_KEY = 'chat_token';
+        let authToken = null;
+        let sessionSeconds = 1800;      // replaced by the server's expires_in
+        let lastActivity = Date.now();
+        let lastRefresh = 0;
+        let idleTimer = null;
+ 
+        // Attach the session token to every /api call (except login/register)
+        // and return to the login screen if the server says the session is gone.
+        const rawFetch = window.fetch.bind(window);
+        window.fetch = async function(url, opts = {}) {
+            const isApi = typeof url === 'string' && url.startsWith('/api/');
+            const isPublic = isApi && (url.startsWith('/api/login') || url.startsWith('/api/register') || url.startsWith('/api/password/'));
+            if (isApi && !isPublic && authToken) {
+                opts.headers = Object.assign({}, opts.headers, { Authorization: 'Bearer ' + authToken });
+            }
+            const response = await rawFetch(url, opts);
+            if (isApi && !isPublic && response.status === 401 && authToken) {
+                endSession('Session expired. Please log in again.');
+            }
+            return response;
+        };
+ 
+        function storeToken(token) {
+            try { token ? localStorage.setItem(TOKEN_KEY, token) : localStorage.removeItem(TOKEN_KEY); } catch (e) {}
+        }
+ 
+        function readStoredToken() {
+            try { return localStorage.getItem(TOKEN_KEY); } catch (e) { return null; }
+        }
+ 
+        function applySession(data) {
+            authToken = data.token;
+            sessionSeconds = data.expires_in || sessionSeconds;
+            lastRefresh = Date.now();
+            storeToken(authToken);
+        }
+ 
+        function setText(id, text) {
+            const el = document.getElementById(id);
+            el.textContent = text || '';
+            el.hidden = !text;
+        }
+ 
+        function showAuthTab(tab) {
+            const login = tab === 'login';
+            document.getElementById('login-form').hidden = !login;
+            document.getElementById('register-form').hidden = login;
+            document.getElementById('forgot-form').hidden = true;
+            document.getElementById('reset-form').hidden = true;
+            document.querySelector('.auth-tabs').hidden = false;
+            document.getElementById('tab-login').classList.toggle('active', login);
+            document.getElementById('tab-register').classList.toggle('active', !login);
+            setText('login-error', ''); setText('register-error', '');
+            setText('forgot-error', ''); setText('forgot-info', '');
+        }
+ 
+        // ---------- Password recovery (FR-04) ----------
+        let resetToken = null;
+ 
+        function showForgot() {
+            showAuthTab('login');
+            document.getElementById('login-form').hidden = true;
+            document.getElementById('forgot-form').hidden = false;
+            document.getElementById('tab-login').classList.remove('active');
+            document.getElementById('forgot-email').focus();
+        }
+ 
+        function showResetForm() {
+            showAuthTab('login');
+            document.getElementById('login-form').hidden = true;
+            document.getElementById('reset-form').hidden = false;
+            document.querySelector('.auth-tabs').hidden = true;
+            setText('reset-error', '');
+            document.getElementById('reset-password').focus();
+        }
+ 
+        async function handleForgot(event) {
+            event.preventDefault();
+            const button = document.getElementById('forgot-submit');
+            setText('forgot-error', ''); setText('forgot-info', '');
+            button.disabled = true;
+            try {
+                const data = await postJson('/api/password/forgot', {
+                    email: document.getElementById('forgot-email').value
+                });
+                setText('forgot-info', data.message);
+            } catch (error) {
+                setText('forgot-error', error.message);
+            } finally {
+                button.disabled = false;
+            }
+        }
+ 
+        async function handleReset(event) {
+            event.preventDefault();
+            const password = document.getElementById('reset-password').value;
+            const confirm = document.getElementById('reset-confirm').value;
+            setText('reset-error', '');
+            if (password !== confirm) {
+                setText('reset-error', 'Passwords do not match.');
+                return;
+            }
+            const button = document.getElementById('reset-submit');
+            button.disabled = true;
+            try {
+                await postJson('/api/password/reset', { token: resetToken, new_password: password });
+                resetToken = null;
+                storeToken(null);                       // any old saved session is no longer valid
+                document.getElementById('reset-form').reset();
+                showLoginScreen('Password reset successful. Please log in with your new password.');
+            } catch (error) {
+                setText('reset-error', error.message);
+            } finally {
+                button.disabled = false;
+            }
+        }
+ 
+        // Opened from the emailed link (…/#reset=TOKEN). Returns true if it handled the page.
+        async function handleResetLink() {
+            const match = window.location.hash.match(/^#reset=([A-Za-z0-9_\-]+)$/);
+            if (!match) return false;
+            resetToken = match[1];
+            history.replaceState(null, '', window.location.pathname);   // keep the token out of the address bar
+            document.getElementById('auth-screen').hidden = false;
+            try {
+                const response = await rawFetch('/api/password/verify', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token: resetToken })
+                });
+                const data = await response.json();
+                if (data.valid) { showResetForm(); return true; }
+            } catch (e) {}
+            resetToken = null;
+            showForgot();
+            setText('forgot-error', 'This reset link is invalid, expired or already used. Request a new one.');
+            return true;
+        }
+ 
+        function showLoginScreen(infoMessage) {
+            document.getElementById('auth-screen').hidden = false;
+            showAuthTab('login');
+            document.getElementById('login-password').value = '';
+            setText('login-info', infoMessage || '');
+        }
+ 
+        async function postJson(url, body) {
+            const response = await window.fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            let data = {};
+            try { data = await response.json(); } catch (e) {}
+            if (!response.ok) {
+                const detail = Array.isArray(data.detail) ? 'Please check the form fields.' : data.detail;
+                throw new Error(detail || `Request failed (HTTP ${response.status}).`);
+            }
+            return data;
+        }
+ 
+        async function handleLogin(event) {
+            event.preventDefault();
+            const button = document.getElementById('login-submit');
+            setText('login-error', ''); setText('login-info', '');
+            button.disabled = true;
+            try {
+                const data = await postJson('/api/login', {
+                    username: document.getElementById('login-username').value,
+                    password: document.getElementById('login-password').value
+                });
+                applySession(data);
+                currentUser = data.username;
+                startApp();
+            } catch (error) {
+                setText('login-error', error.message);
+            } finally {
+                button.disabled = false;
+            }
+        }
+ 
+        async function handleRegister(event) {
+            event.preventDefault();
+            const button = document.getElementById('register-submit');
+            setText('register-error', '');
+            button.disabled = true;
+            try {
+                const username = document.getElementById('register-username').value.trim();
+                await postJson('/api/register', {
+                    username: username,
+                    email: document.getElementById('register-email').value,
+                    password: document.getElementById('register-password').value
+                });
+                // Redirect to login after successful registration
+                document.getElementById('register-form').reset();
+                showLoginScreen('Registration successful. Please log in.');
+                document.getElementById('login-username').value = username;
+                document.getElementById('login-password').focus();
+            } catch (error) {
+                setText('register-error', error.message);
+            } finally {
+                button.disabled = false;
+            }
+        }
+ 
+        function startApp() {
+            document.getElementById('auth-screen').hidden = true;
+            document.getElementById('current-user-label').textContent = currentUser;
+            activeContact = null;
+            document.getElementById('chat-header').innerText = 'Select a contact to begin messaging';
+            document.getElementById('messages-list').innerHTML = '';
+            lastActivity = Date.now();
+            initWebSocket();
+            loadContacts();
+            clearInterval(idleTimer);
+            idleTimer = setInterval(checkIdle, 10000);
+        }
+ 
+        function endSession(message) {
+            clearInterval(idleTimer);
+            if (ws) { ws.onmessage = null; ws.onclose = null; ws.close(); ws = null; }
+            authToken = null;
+            currentUser = null;
+            activeContact = null;
+            storeToken(null);
+            profileCache = {};
+            lastContacts = [];
+            try { document.getElementById('profile-dialog').close(); } catch (e) {}
+            document.getElementById('own-avatar').innerHTML = '';
+            document.getElementById('messages-list').innerHTML = '';
+            document.getElementById('contacts-list').innerHTML = '';
+            showLoginScreen(message);
+        }
+ 
+        async function logout() {
+            try { await window.fetch('/api/logout', { method: 'POST' }); } catch (e) {}
+            endSession('You have been logged out.');
+        }
+ 
+        // Idle timeout: expire the session after inactivity (30 minutes by default).
+        function checkIdle() {
+            if (authToken && Date.now() - lastActivity > sessionSeconds * 1000) {
+                endSession('Session expired due to inactivity. Please log in again.');
+            }
+        }
+ 
+        async function refreshSession() {
+            lastRefresh = Date.now();
+            try {
+                const response = await window.fetch('/api/session');
+                if (response.ok) applySession(await response.json());
+            } catch (e) {}
+        }
+ 
+        function trackActivity() {
+            if (!authToken) return;
+            lastActivity = Date.now();
+            if (Date.now() - lastRefresh > 60000) refreshSession();   // keep the token alive while active
+        }
+ 
+        async function restoreSession() {
+            const stored = readStoredToken();
+            if (!stored) { showLoginScreen(); return; }
+            try {
+                const response = await rawFetch('/api/session', { headers: { Authorization: 'Bearer ' + stored } });
+                if (response.status === 401) {
+                    // Expired, invalid or logged-out session: never grant silent access.
+                    storeToken(null);
+                    showLoginScreen('Session expired. Please log in again.');
+                    return;
+                }
+                if (!response.ok) throw new Error('server error');
+                const data = await response.json();
+                applySession(data);
+                currentUser = data.username;
+                startApp();   // back in the account without re-entering credentials
+            } catch (e) {
+                // Server unreachable: keep the saved session for the next attempt.
+                showLoginScreen('Could not reach the server. Please try again.');
+            }
+        }
+ 
+        // ================= Chat application =================
         function initWebSocket() {
-            ws = new WebSocket(`ws://${window.location.host}/ws/${currentUser}`);
+            const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            ws = new WebSocket(`${scheme}://${window.location.host}/ws/${currentUser}?token=${encodeURIComponent(authToken)}`);
             ws.onmessage = function(event) {
                 const data = JSON.parse(event.data);
                 handleIncomingSignal(data);
             };
+            ws.onclose = function(event) {
+                // 4401 = missing/expired/invalid session, 4403 = token belongs to another user
+                if (authToken && (event.code === 4401 || event.code === 4403)) {
+                    endSession('Session expired. Please log in again.');
+                }
+            };
+        }
+ 
+        // ================= Profile management (FR-05) =================
+        const MAX_AVATAR_BYTES = 2 * 1024 * 1024;   // server enforces its own limit too
+        let profileCache = {};
+        let lastContacts = [];
+
+        function escapeHtml(text) {
+            return String(text == null ? '' : text).replace(/[&<>"']/g, c => (
+                { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+            ));
         }
 
-        // --- Contact Management JS Functions ---
-        async function loadUsersDropdown() {
-            const response = await fetch('/api/users');
-            const data = await response.json();
-            const select = document.getElementById('user-select');
-            select.innerHTML = '';
-            
-            data.users.forEach(username => {
-                const opt = document.createElement('option');
-                opt.value = username;
-                opt.innerText = username;
-                if (username === currentUser) opt.selected = true;
-                select.appendChild(opt);
-            });
+        function profileFor(username) {
+            return profileCache[username] || { username: username, display_name: username, bio: '', avatar_url: null };
         }
 
-        function switchAccount(newUsername) {
-            if (!newUsername || newUsername === currentUser) return;
-            currentUser = newUsername;
-            activeContact = null;
-            
-            document.getElementById('chat-header').innerText = 'Select a contact to begin messaging';
-            document.getElementById('messages-list').innerHTML = '';
-            
-            if (ws) ws.close();
-            initWebSocket();
-            loadContacts();
+        function displayNameOf(username) {
+            return profileFor(username).display_name || username;
         }
 
-        async function addContactPrompt() {
-            const contactName = prompt("Enter username of contact to add:");
-            if (!contactName || !contactName.trim()) return;
+        function avatarHTML(username, size) {
+            const profile = profileFor(username);
+            const style = `width:${size}px;height:${size}px;font-size:${Math.round(size * 0.45)}px;`;
+            if (profile.avatar_url) {
+                return `<img class="avatar" src="${escapeHtml(profile.avatar_url)}" alt="" style="${style}">`;
+            }
+            const initial = escapeHtml((profile.display_name || username).trim().charAt(0).toUpperCase() || '?');
+            return `<span class="avatar" style="${style}">${initial}</span>`;
+        }
 
-            const response = await fetch('/api/contacts/add', {
-                method: 'POST',
+        async function loadProfiles(usernames) {
+            const names = [...new Set(usernames.filter(Boolean))];
+            if (names.length === 0) return;
+            try {
+                const response = await fetch('/api/profiles?users=' + encodeURIComponent(names.join(',')));
+                if (!response.ok) return;
+                const data = await response.json();
+                (data.profiles || []).forEach(p => { profileCache[p.username] = p; });
+            } catch (e) {}
+        }
+
+        function renderOwnProfile() {
+            if (!currentUser) return;
+            document.getElementById('current-user-label').textContent = displayNameOf(currentUser);
+            document.getElementById('own-avatar').innerHTML = avatarHTML(currentUser, 28);
+        }
+
+        function updateChatHeader() {
+            if (!activeContact) return;
+            const profile = profileFor(activeContact);
+            let text = `Chatting with: ${profile.display_name}`;
+            if (profile.display_name !== activeContact) text += ` (@${activeContact})`;
+            if (profile.bio) text += ` - ${profile.bio}`;
+            document.getElementById('chat-header').innerText = text;
+        }
+
+        async function sendJson(method, url, body) {
+            const response = await window.fetch(url, {
+                method: method,
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user_id: currentUser,
-                    contact_username: contactName.trim()
-                })
+                body: JSON.stringify(body)
             });
-            const data = await response.json();
+            return readJsonResult(response);
+        }
 
-            if (data.success) {
-                alert(`Success: ${data.message}`);
-                loadUsersDropdown(); // Refresh dropdown so newly added user appears!
-                loadContacts();
-            } else {
-                alert(`Error: ${data.error || "Failed to add contact"}`);
+        async function readJsonResult(response) {
+            let data = {};
+            try { data = await response.json(); } catch (e) {}
+            if (!response.ok) {
+                const detail = Array.isArray(data.detail) ? 'Please check the form fields.' : data.detail;
+                throw new Error(detail || `Request failed (HTTP ${response.status}).`);
+            }
+            return data;
+        }
+
+        function updateBioCounter() {
+            const length = document.getElementById('profile-bio').value.trim().length;
+            document.getElementById('profile-bio-count').textContent = `${length}/150`;
+        }
+
+        // Show a saved profile in the dialog. The text fields are only overwritten
+        // when the dialog is closed or when force is set, so typing is never lost.
+        function fillProfileDialog(force) {
+            if (!currentUser) return;
+            const dialog = document.getElementById('profile-dialog');
+            const profile = profileFor(currentUser);
+            document.getElementById('profile-avatar-preview').innerHTML = avatarHTML(currentUser, 96);
+            document.getElementById('profile-remove-avatar').disabled = !profile.avatar_url;
+            if (force || !dialog.open) {
+                document.getElementById('profile-display-name').value = profile.display_name;
+                document.getElementById('profile-bio').value = profile.bio;
+                updateBioCounter();
             }
         }
 
+        function openProfileDialog() {
+            if (!currentUser) return;
+            setText('profile-error', ''); setText('profile-info', '');
+            fillProfileDialog(true);
+            document.getElementById('profile-dialog').showModal();
+            document.getElementById('profile-display-name').focus();
+        }
+
+        function closeProfileDialog() {
+            document.getElementById('profile-dialog').close();
+        }
+
+        // Store a profile the server confirmed and refresh everything that shows it.
+        function applyOwnProfile(profile) {
+            profileCache[profile.username] = profile;
+            renderOwnProfile();
+            fillProfileDialog(true);
+            renderContactsList();
+            updateChatHeader();
+        }
+
+        async function saveProfile(event) {
+            event.preventDefault();
+            const button = document.getElementById('profile-save');
+            setText('profile-error', ''); setText('profile-info', '');
+            button.disabled = true;
+            try {
+                const data = await sendJson('PUT', '/api/profile', {
+                    display_name: document.getElementById('profile-display-name').value,
+                    bio: document.getElementById('profile-bio').value
+                });
+                applyOwnProfile(data.profile);
+                setText('profile-info', data.message || 'Profile saved.');
+            } catch (error) {
+                setText('profile-error', error.message + ' Your profile was not changed.');
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        async function uploadAvatar() {
+            const input = document.getElementById('profile-avatar-input');
+            const file = input.files && input.files[0];
+            if (!file) return;
+            setText('profile-error', ''); setText('profile-info', '');
+
+            if (file.size > MAX_AVATAR_BYTES) {
+                setText('profile-error', `Image is too large (${(file.size / 1048576).toFixed(1)} MB). The maximum size is 2 MB. Your profile picture was not changed.`);
+                input.value = '';
+                return;
+            }
+
+            const form = new FormData();
+            form.append('file', file);
+            try {
+                const response = await window.fetch('/api/profile/avatar', { method: 'POST', body: form });
+                const data = await readJsonResult(response);
+                applyOwnProfile(data.profile);
+                setText('profile-info', data.message || 'Profile picture updated.');
+            } catch (error) {
+                setText('profile-error', error.message + ' Your profile picture was not changed.');
+            } finally {
+                input.value = '';
+            }
+        }
+
+        async function removeAvatar() {
+            setText('profile-error', ''); setText('profile-info', '');
+            try {
+                const response = await window.fetch('/api/profile/avatar', { method: 'DELETE' });
+                const data = await readJsonResult(response);
+                applyOwnProfile(data.profile);
+                setText('profile-info', data.message || 'Profile picture removed.');
+            } catch (error) {
+                setText('profile-error', error.message);
+            }
+        }
+
+        // --- Contact Management JS Functions ---
+        function openAddContactDialog() {
+            const dialog = document.getElementById('add-contact-dialog');
+            const errorMessage = document.getElementById('add-contact-error');
+            document.getElementById('add-contact-username').value = '';
+            errorMessage.hidden = window.location.protocol !== 'file:';
+            if (window.location.protocol === 'file:') {
+                errorMessage.textContent = 'Open the chat app from its server at http://127.0.0.1:8000/; opening index.html directly blocks API requests.';
+            }
+            dialog.showModal();
+            document.getElementById('add-contact-username').focus();
+        }
+ 
+        function closeAddContactDialog() {
+            document.getElementById('add-contact-dialog').close();
+        }
+ 
+        async function addContact(event) {
+            event.preventDefault();
+            const submitButton = document.getElementById('add-contact-submit');
+            const errorMessage = document.getElementById('add-contact-error');
+            const contactName = document.getElementById('add-contact-username').value.trim();
+            if (!contactName) return;
+ 
+            if (window.location.protocol === 'file:') {
+                errorMessage.textContent = 'Open the chat app from its server at http://127.0.0.1:8000/; opening index.html directly blocks API requests.';
+                errorMessage.hidden = false;
+                return;
+            }
+ 
+            submitButton.disabled = true;
+            errorMessage.hidden = true;
+ 
+            try {
+                const response = await fetch('/api/contacts/add', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        user_id: currentUser,
+                        contact_username: contactName
+                    })
+                });
+                const responseText = await response.text();
+                let data;
+                try {
+                    data = JSON.parse(responseText);
+                } catch {
+                    throw new Error(`The server returned an unexpected response (HTTP ${response.status}).`);
+                }
+ 
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || data.detail || "Failed to add contact");
+                }
+ 
+                closeAddContactDialog();
+                alert(data.message);
+                await loadContacts();
+            } catch (error) {
+                errorMessage.textContent = error.message || "Failed to add contact. Please try again.";
+                errorMessage.hidden = false;
+            } finally {
+                submitButton.disabled = false;
+            }
+        }
+ 
         async function loadContacts() {
             loadPendingRequests(); // Load pending requests concurrently
             
             const response = await fetch(`/api/contacts/${currentUser}`);
             const data = await response.json();
+            lastContacts = data.contacts || [];
+
+            // Profiles (display name, status, picture) for contacts and for me.
+            await loadProfiles([...lastContacts, currentUser]);
+            renderOwnProfile();
+            updateChatHeader();
+            renderContactsList();
+        }
+
+        function renderContactsList() {
             const listElement = document.getElementById('contacts-list');
             listElement.innerHTML = '';
             
-            if (!data.contacts || data.contacts.length === 0) {
+            if (lastContacts.length === 0) {
                 listElement.innerHTML = '<div style="padding:10px; color:#8696a0; font-size:12px;">No contacts found. Click "+ Add" above to add contacts.</div>';
                 return;
             }
-
-            data.contacts.forEach(contact => {
+ 
+            lastContacts.forEach(contact => {
+                const profile = profileFor(contact);
                 const item = document.createElement('div');
                 item.className = `contact-item ${activeContact === contact ? 'active' : ''}`;
                 item.style.display = 'flex';
@@ -146,19 +776,25 @@
                 item.style.alignItems = 'center';
                 
                 item.innerHTML = `
-                    <span onclick="selectContact('${contact}')" style="flex:1;">&#128100; ${contact}</span>
+                    <span class="contact-main" onclick="selectContact('${contact}')" style="cursor:pointer;" title="@${escapeHtml(contact)}">
+                        ${avatarHTML(contact, 36)}
+                        <span class="contact-text">
+                            <span class="contact-name">${escapeHtml(profile.display_name)}</span>
+                            ${profile.bio ? `<span class="contact-bio">${escapeHtml(profile.bio)}</span>` : ''}
+                        </span>
+                    </span>
                     <button onclick="removeContact('${contact}')" style="background:none; border:none; color:#ff4d4d; cursor:pointer; font-size:14px;" title="Remove Contact">❌</button>
                 `;
                 listElement.appendChild(item);
             });
         }
-
+ 
         async function loadPendingRequests() {
             const response = await fetch(`/api/contacts/pending/${currentUser}`);
             const data = await response.json();
             const container = document.getElementById('pending-requests');
             container.innerHTML = '';
-
+ 
             if (data.pending && data.pending.length > 0) {
                 container.innerHTML = '<div style="font-size:11px; font-weight:bold; color:#ffc107; margin-bottom:5px;">PENDING FRIEND REQUESTS</div>';
                 data.pending.forEach(reqUser => {
@@ -175,7 +811,7 @@
                 });
             }
         }
-
+ 
         async function respondRequest(requester, action) {
             await fetch('/api/contacts/respond', {
                 method: 'POST',
@@ -184,16 +820,16 @@
             });
             loadContacts();
         }
-
+ 
         async function removeContact(contactName) {
             if (!confirm(`Are you sure you want to remove ${contactName} from your contacts?`)) return;
-
+ 
             await fetch('/api/contacts/remove', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ user_id: currentUser, contact_username: contactName })
             });
-
+ 
             if (activeContact === contactName) {
                 activeContact = null;
                 document.getElementById('chat-header').innerText = 'Select a contact to begin messaging';
@@ -201,14 +837,14 @@
             }
             loadContacts();
         }
-
+ 
         function selectContact(contact) {
             activeContact = contact;
-            document.getElementById('chat-header').innerText = `Chatting with: ${contact}`;
+            updateChatHeader();
             loadContacts();
             loadHistory(); // Load stored history (ADDED FOR ISSUE #23)
         }
-
+ 
         // --- Fetch Chat History from SQLite (ADDED FOR ISSUE #23) ---
         async function loadHistory() {
             if (!activeContact) return;
@@ -224,7 +860,7 @@
                 });
             }
         }
-
+ 
         // --- Receive Text Message Event Handler (ADDED FOR ISSUE #20) ---
         function handleIncomingSignal(data) {
             if (data.type === "receive_message") {
@@ -254,33 +890,43 @@
                     }
                 }
             }
+            // A contact (or I, from another tab) changed a profile (FR-05)
+            else if (data.type === "profile_update" && data.profile) {
+                profileCache[data.profile.username] = data.profile;
+                if (data.profile.username === currentUser) {
+                    renderOwnProfile();
+                    fillProfileDialog();
+                }
+                updateChatHeader();
+                if (!document.getElementById('global-search').value.trim()) renderContactsList();
+            }
         }
-
+ 
         // --- Global Search Engine & Term Highlighting (UPDATED FOR ISSUE #31) ---
         async function handleSearch() {
             const searchInput = document.getElementById('global-search');
             const query = searchInput.value.trim();
             const listElement = document.getElementById('contacts-list');
-
+ 
             // If query is emptied, restore standard contacts view
             if (!query || query.length === 0) {
                 loadContacts();
                 return;
             }
-
+ 
             try {
                 const response = await fetch(`/api/search?username=${currentUser}&q=${encodeURIComponent(query)}`);
                 const data = await response.json();
-
+ 
                 listElement.innerHTML = '';
-
+ 
                 // 1. Render Contact Matches Section
                 if (data.contacts && data.contacts.length > 0) {
                     const contactHeader = document.createElement('div');
                     contactHeader.style.cssText = 'padding:6px 10px; font-size:11px; font-weight:bold; color:#ffc107; background:#1e293b; border-radius:4px; margin-bottom:6px;';
                     contactHeader.innerText = `CONTACTS (${data.contacts.length})`;
                     listElement.appendChild(contactHeader);
-
+ 
                     data.contacts.forEach(contact => {
                         const item = document.createElement('div');
                         item.className = `contact-item ${activeContact === contact ? 'active' : ''}`;
@@ -289,14 +935,14 @@
                         listElement.appendChild(item);
                     });
                 }
-
+ 
                 // 2. Render Message History Search Matches Section
                 if (data.messages && data.messages.length > 0) {
                     const msgHeader = document.createElement('div');
                     msgHeader.style.cssText = 'padding:6px 10px; font-size:11px; font-weight:bold; color:#53bdeb; background:#1e293b; border-radius:4px; margin-top:10px; margin-bottom:6px;';
                     msgHeader.innerText = `MESSAGES FOUND (${data.messages.length})`;
                     listElement.appendChild(msgHeader);
-
+ 
                     data.messages.forEach(msg => {
                         const otherUser = (msg.sender === currentUser) ? msg.recipient : msg.sender;
                         const item = document.createElement('div');
@@ -317,7 +963,7 @@
                         listElement.appendChild(item);
                     });
                 }
-
+ 
                 if ((!data.contacts || data.contacts.length === 0) && (!data.messages || data.messages.length === 0)) {
                     listElement.innerHTML = '<div style="padding:15px; color:#8696a0; font-size:12px; text-align:center;">No matching contacts or messages found.</div>';
                 }
@@ -325,13 +971,13 @@
                 console.error("Search execution error:", err);
             }
         }
-
+ 
         function highlightSearchTerm(text, query) {
             if (!query) return text;
             const re = new RegExp(`(${query})`, 'gi');
             return text.replace(re, '<mark style="background:#ffc107; color:#000; padding:0 2px; border-radius:2px; font-weight:bold;">$1</mark>');
         }
-
+ 
         function sendMessage() {
             const input = document.getElementById('message-input');
             const content = input.value.trim();
@@ -340,7 +986,7 @@
                 if(!activeContact) alert("Please select a contact first!");
                 return;
             }
-
+ 
             const msgId = 'msg-' + Date.now();
             const payload = {
                 type: "send_message",
@@ -350,12 +996,12 @@
                 content: content,
                 timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
             };
-
+ 
             ws.send(JSON.stringify(payload));
             appendMessageUI(currentUser, content, payload.timestamp, 'sent', msgId);
             input.value = '';
         }
-
+ 
         function appendMessageUI(sender, content, timeStr, status, msgId) {
             const list = document.getElementById('messages-list');
             const msgDiv = document.createElement('div');
@@ -369,8 +1015,7 @@
             list.appendChild(msgDiv);
             list.scrollTop = list.scrollHeight;
         }
-
-        // --- Multipart File & Image Upload Engine (UPDATED FOR ISSUE #29) ---
+ 
         // --- Global Scope Lightbox Modal Functions (FIXED FOR ISSUE #29) ---
         window.openModal = function(src) {
             if (!src) return;
@@ -379,7 +1024,7 @@
             modalImg.src = src;
             modal.style.display = 'flex';
         };
-
+ 
         window.closeModal = function(e) {
             if (e) {
                 e.preventDefault();
@@ -390,7 +1035,7 @@
             modal.style.display = 'none';
             modalImg.src = '';
         };
-
+ 
         // --- Global Document-Level Click Interceptor (PREVENTS EVENT BUBBLING & STATE RESET) ---
         document.addEventListener('click', function(e) {
             const imgTarget = e.target.closest('#messages-list img');
@@ -400,12 +1045,12 @@
                 window.openModal(imgTarget.src);
             }
         }, true);
-
+ 
         // --- Refactored Drag & Drop + File Upload Engine (UPDATED FOR ISSUE #29) ---
         async function uploadFile(droppedFile = null) {
             const fileInput = document.getElementById('file-input');
             let file = droppedFile;
-
+ 
             if (!file) {
                 if (!fileInput.files || fileInput.files.length === 0) return;
                 file = fileInput.files[0];
@@ -416,28 +1061,27 @@
                 fileInput.value = '';
                 return;
             }
-
+ 
             const formData = new FormData();
             formData.append("file", file);
-
+ 
             try {
                 const response = await fetch('/api/upload', {
                     method: 'POST',
                     body: formData
                 });
                 const result = await response.json();
-
+ 
                 if (result.success) {
                     const isImage = file.type.startsWith('image/');
                     let formattedContent = "";
-
+ 
                     if (isImage) {
-                        // Pure HTML img element without fragile inline onclick handlers
                         formattedContent = `<div style="margin-top:4px;"><img src="${result.file_url}" alt="${result.filename}" style="max-width:260px; max-height:260px; border-radius:8px; display:block; border:1px solid #2e3b52; cursor:pointer;" title="Click to expand"></div>`;
                     } else {
                         formattedContent = `<div style="margin-top:4px;"><a href="${result.file_url}" target="_blank" download="${result.filename}" style="color:#53bdeb; text-decoration:underline; font-weight:bold;">📎 Download ${result.filename}</a></div>`;
                     }
-
+ 
                     const msgId = 'msg-' + Date.now();
                     const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
                     const payload = {
@@ -448,7 +1092,7 @@
                         content: formattedContent,
                         timestamp: timeStr
                     };
-
+ 
                     ws.send(JSON.stringify(payload));
                     appendMessageUI(currentUser, formattedContent, timeStr, 'sent', msgId);
                 } else {
@@ -461,52 +1105,62 @@
                 fileInput.value = '';
             }
         }
-
+ 
         // --- Global Chat Image Event Delegation (ADDED TO FIX BLANK MODAL & BUBBLING) ---
         function initImageEventDelegation() {
             const messagesList = document.getElementById('messages-list');
             messagesList.addEventListener('click', function(e) {
                 if (e.target && e.target.tagName === 'IMG') {
-                    e.stopPropagation(); // Stop event from resetting activeContact or reloading state
-                    openModal(e.target.src); // Open full-resolution image source
+                    e.stopPropagation();
+                    openModal(e.target.src);
                 }
             });
         }
-
+ 
         // --- Drag and Drop Event Listeners (ADDED FOR ISSUE #29 ENHANCEMENT) ---
         function initDragAndDrop() {
             const chatArea = document.getElementById('chat-area');
-
+ 
             chatArea.addEventListener('dragover', (e) => {
                 e.preventDefault();
                 chatArea.style.outline = '2px dashed #007bff';
                 chatArea.style.outlineOffset = '-10px';
                 chatArea.style.background = '#141c2b';
             });
-
+ 
             chatArea.addEventListener('dragleave', (e) => {
                 e.preventDefault();
                 chatArea.style.outline = 'none';
                 chatArea.style.background = '#0f141d';
             });
-
+ 
             chatArea.addEventListener('drop', (e) => {
                 e.preventDefault();
                 chatArea.style.outline = 'none';
                 chatArea.style.background = '#0f141d';
-
+ 
                 if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
                     uploadFile(e.dataTransfer.files[0]);
                 }
             });
         }
-
+ 
+        window.addEventListener('storage', function(event) {
+            if (event.key !== TOKEN_KEY) return;
+            if (!event.newValue && authToken) {
+                endSession('You have been logged out.');
+            } else if (event.newValue && authToken) {
+                authToken = event.newValue;   // another tab refreshed the session
+            }
+        });
+ 
         window.onload = function() {
-            loadUsersDropdown();
-            initWebSocket();
-            loadContacts();
             initDragAndDrop();
-            initImageEventDelegation(); // Initialize image event delegation
+            initImageEventDelegation();
+            ['mousemove', 'keydown', 'click', 'touchstart', 'scroll'].forEach(name =>
+                document.addEventListener(name, trackActivity, { passive: true, capture: true })
+            );
+            handleResetLink().then(handled => { if (!handled) restoreSession(); });   // reset link first; otherwise restore the saved session
         };
     </script>
 </body>
