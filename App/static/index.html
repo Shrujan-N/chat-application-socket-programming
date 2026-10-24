@@ -268,7 +268,7 @@
  
         function endSession(message) {
             clearInterval(idleTimer);
-            if (ws) { ws.onmessage = null; ws.close(); ws = null; }
+            if (ws) { ws.onmessage = null; ws.onclose = null; ws.close(); ws = null; }
             authToken = null;
             currentUser = null;
             activeContact = null;
@@ -309,14 +309,20 @@
             if (!stored) { showLoginScreen(); return; }
             try {
                 const response = await rawFetch('/api/session', { headers: { Authorization: 'Bearer ' + stored } });
-                if (!response.ok) throw new Error('expired');
+                if (response.status === 401) {
+                    // Expired, invalid or logged-out session: never grant silent access.
+                    storeToken(null);
+                    showLoginScreen('Session expired. Please log in again.');
+                    return;
+                }
+                if (!response.ok) throw new Error('server error');
                 const data = await response.json();
                 applySession(data);
                 currentUser = data.username;
-                startApp();
+                startApp();   // back in the account without re-entering credentials
             } catch (e) {
-                storeToken(null);
-                showLoginScreen('Session expired. Please log in again.');
+                // Server unreachable: keep the saved session for the next attempt.
+                showLoginScreen('Could not reach the server. Please try again.');
             }
         }
  
@@ -327,6 +333,12 @@
             ws.onmessage = function(event) {
                 const data = JSON.parse(event.data);
                 handleIncomingSignal(data);
+            };
+            ws.onclose = function(event) {
+                // 4401 = missing/expired/invalid session, 4403 = token belongs to another user
+                if (authToken && (event.code === 4401 || event.code === 4403)) {
+                    endSession('Session expired. Please log in again.');
+                }
             };
         }
  
@@ -769,6 +781,15 @@
             });
         }
  
+        window.addEventListener('storage', function(event) {
+            if (event.key !== TOKEN_KEY) return;
+            if (!event.newValue && authToken) {
+                endSession('You have been logged out.');
+            } else if (event.newValue && authToken) {
+                authToken = event.newValue;   // another tab refreshed the session
+            }
+        });
+ 
         window.onload = function() {
             initDragAndDrop();
             initImageEventDelegation();
@@ -780,4 +801,3 @@
     </script>
 </body>
 </html>
- 

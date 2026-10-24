@@ -70,6 +70,15 @@ def init_db():
     );
     """)
     
+    # Revoked (logged-out) sessions, so a saved token cannot be reused (FR-03)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS revoked_sessions (
+        sid TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+    );
+    """)
+    
     # Pre-seed initial users for testing if database is empty
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:
@@ -100,4 +109,3 @@ def init_db():
  
 if __name__ == "__main__":
     init_db()
- 

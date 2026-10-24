@@ -76,13 +76,24 @@ def _sign(signing_input: str) -> str:
     return _b64(hmac.new(SECRET_KEY, signing_input.encode(), hashlib.sha256).digest())
 
 
-def create_token(username: str, ttl_seconds: int = None) -> str:
-    """Create an HS256 JWT. ttl_seconds defaults to the session timeout."""
+def new_session_id() -> str:
+    return secrets.token_hex(16)
+
+
+def create_token(username: str, ttl_seconds: int = None, sid: str = None) -> str:
+    """Create an HS256 JWT. ttl_seconds defaults to the session timeout.
+
+    `sid` identifies the login session. Refreshed/resumed tokens keep the same
+    sid so that logging out can revoke the whole session.
+    """
     if ttl_seconds is None:
         ttl_seconds = SESSION_TIMEOUT_MINUTES * 60
     now = int(time.time())
     header = _b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-    body = _b64(json.dumps({"sub": username, "iat": now, "exp": now + ttl_seconds}).encode())
+    body = _b64(json.dumps({
+        "sub": username, "iat": now, "exp": now + ttl_seconds,
+        "sid": sid or new_session_id(),
+    }).encode())
     signing_input = f"{header}.{body}"
     return f"{signing_input}.{_sign(signing_input)}"
 

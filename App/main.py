@@ -14,6 +14,7 @@ from security import (
     hash_password, verify_password, create_token, decode_token,
     TokenError, SESSION_TIMEOUT_MINUTES,
 )
+from auth_service import validate_session, revoke_session
  
  
 class RegisterSchema(BaseModel):
@@ -52,7 +53,7 @@ async def require_session(request: Request, call_next):
     path = request.url.path
     if path.startswith("/api/") and path not in PUBLIC_API_PATHS:
         try:
-            decode_token(get_bearer_token(request))
+            validate_session(get_bearer_token(request))   # also rejects logged-out sessions
         except TokenError as error:
             return JSONResponse(status_code=401, content={"detail": str(error)})
     return await call_next(request)
@@ -270,18 +271,21 @@ async def login_user(payload: LoginSchema, request: Request):
 @app.get("/api/session")
 async def refresh_session(request: Request):
     # The middleware already rejected missing/expired/invalid tokens.
-    claims = decode_token(get_bearer_token(request))
+    claims = validate_session(get_bearer_token(request))
     return {
         "success": True,
         "username": claims["sub"],
-        "token": create_token(claims["sub"]),
+        # same sid: the refreshed token belongs to the same login session
+        "token": create_token(claims["sub"], sid=claims.get("sid")),
         "expires_in": SESSION_TIMEOUT_MINUTES * 60
     }
  
  
 @app.post("/api/logout")
 async def logout_user(request: Request):
-    claims = decode_token(get_bearer_token(request))
+    token = get_bearer_token(request)
+    claims = validate_session(token)
+    revoke_session(token)   # a saved copy of this token can no longer restore the session
     conn = get_db()
     try:
         cursor = conn.cursor()
@@ -312,7 +316,7 @@ manager = ConnectionManager()
 async def websocket_endpoint(websocket: WebSocket, username: str):
     # Only an authenticated user may open a socket for their own username
     try:
-        claims = decode_token(websocket.query_params.get("token", ""))
+        claims = validate_session(websocket.query_params.get("token", ""))
     except TokenError:
         await websocket.close(code=4401)
         return
@@ -530,4 +534,3 @@ async def search_query(username: str, q: str):
  
     conn.close()
     return {"contacts": contacts, "messages": messages}
- 
