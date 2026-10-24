@@ -255,7 +255,81 @@
             }
         }
 
-        function handleSearch() {}
+        // --- Global Search Engine & Term Highlighting (UPDATED FOR ISSUE #31) ---
+        async function handleSearch() {
+            const searchInput = document.getElementById('global-search');
+            const query = searchInput.value.trim();
+            const listElement = document.getElementById('contacts-list');
+
+            // If query is emptied, restore standard contacts view
+            if (!query || query.length === 0) {
+                loadContacts();
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/search?username=${currentUser}&q=${encodeURIComponent(query)}`);
+                const data = await response.json();
+
+                listElement.innerHTML = '';
+
+                // 1. Render Contact Matches Section
+                if (data.contacts && data.contacts.length > 0) {
+                    const contactHeader = document.createElement('div');
+                    contactHeader.style.cssText = 'padding:6px 10px; font-size:11px; font-weight:bold; color:#ffc107; background:#1e293b; border-radius:4px; margin-bottom:6px;';
+                    contactHeader.innerText = `CONTACTS (${data.contacts.length})`;
+                    listElement.appendChild(contactHeader);
+
+                    data.contacts.forEach(contact => {
+                        const item = document.createElement('div');
+                        item.className = `contact-item ${activeContact === contact ? 'active' : ''}`;
+                        item.innerHTML = `👤 ${highlightSearchTerm(contact, query)}`;
+                        item.onclick = () => selectContact(contact);
+                        listElement.appendChild(item);
+                    });
+                }
+
+                // 2. Render Message History Search Matches Section
+                if (data.messages && data.messages.length > 0) {
+                    const msgHeader = document.createElement('div');
+                    msgHeader.style.cssText = 'padding:6px 10px; font-size:11px; font-weight:bold; color:#53bdeb; background:#1e293b; border-radius:4px; margin-top:10px; margin-bottom:6px;';
+                    msgHeader.innerText = `MESSAGES FOUND (${data.messages.length})`;
+                    listElement.appendChild(msgHeader);
+
+                    data.messages.forEach(msg => {
+                        const otherUser = (msg.sender === currentUser) ? msg.recipient : msg.sender;
+                        const item = document.createElement('div');
+                        item.className = 'contact-item';
+                        item.style.fontSize = '12px';
+                        item.innerHTML = `
+                            <div style="display:flex; justify-content:space-between; color:#8696a0; font-size:10px;">
+                                <span>💬 Chat with: ${otherUser}</span>
+                                <span>${msg.timestamp}</span>
+                            </div>
+                            <div style="margin-top:4px; color:#fff; word-break:break-word;">
+                                ${highlightSearchTerm(msg.content, query)}
+                            </div>
+                        `;
+                        item.onclick = () => {
+                            selectContact(otherUser);
+                        };
+                        listElement.appendChild(item);
+                    });
+                }
+
+                if ((!data.contacts || data.contacts.length === 0) && (!data.messages || data.messages.length === 0)) {
+                    listElement.innerHTML = '<div style="padding:15px; color:#8696a0; font-size:12px; text-align:center;">No matching contacts or messages found.</div>';
+                }
+            } catch (err) {
+                console.error("Search execution error:", err);
+            }
+        }
+
+        function highlightSearchTerm(text, query) {
+            if (!query) return text;
+            const re = new RegExp(`(${query})`, 'gi');
+            return text.replace(re, '<mark style="background:#ffc107; color:#000; padding:0 2px; border-radius:2px; font-weight:bold;">$1</mark>');
+        }
 
         function sendMessage() {
             const input = document.getElementById('message-input');
