@@ -10,7 +10,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel
 from typing import Dict, Optional
-from database import init_db, get_db
+from database import init_db as init_core_db, get_db as core_get_db
 from security import (
     hash_password, verify_password, create_token, decode_token,
     TokenError, SESSION_TIMEOUT_MINUTES,
@@ -86,7 +86,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSock
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from database import get_db, init_db
+from web_database import get_db, init_db as init_web_db
 
 BASE = Path(__file__).resolve().parent
 STATIC = BASE / "static"
@@ -94,7 +94,8 @@ UPLOADS = BASE / "uploads"
 STATIC.mkdir(exist_ok=True)
 UPLOADS.mkdir(exist_ok=True)
 app = FastAPI(title="Chat Application")
-init_db()
+init_core_db()
+init_web_db()
 app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS)), name="uploads")
 
