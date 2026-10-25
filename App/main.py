@@ -33,9 +33,27 @@ LOCKOUT_MINUTES = int(os.environ.get("LOCKOUT_MINUTES", "15"))
 PUBLIC_API_PATHS = {"/api/register", "/api/login"}
  
 app = FastAPI(title="Chat Application - Socket Programming")
+import asyncio
+import shutil
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 
-# Initialize SQLite database schema
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from database import get_db, init_db
+
+BASE = Path(__file__).resolve().parent
+STATIC = BASE / "static"
+UPLOADS = BASE / "uploads"
+STATIC.mkdir(exist_ok=True)
+UPLOADS.mkdir(exist_ok=True)
+app = FastAPI(title="Chat Application")
 init_db()
+app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS)), name="uploads")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(APP_DIR, "static")
