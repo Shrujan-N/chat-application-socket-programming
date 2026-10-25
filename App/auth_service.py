@@ -3,10 +3,14 @@ import math
 import os
 import re
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 
 from database import get_db
-from security import hash_password, verify_password, create_token, SESSION_TIMEOUT_MINUTES
+from security import (
+    hash_password, verify_password, create_token, decode_token,
+    TokenError, SESSION_TIMEOUT_MINUTES,
+)
 
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_MINUTES = int(os.environ.get("LOCKOUT_MINUTES", "15"))
@@ -201,3 +205,74 @@ def authenticate(username: str, password: str, ip=None) -> dict:
         }
     finally:
         conn.close()
+
+
+# ------------------------------------------------- session management (FR-03)
+def _is_revoked(sid: str) -> bool:
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT 1 FROM revoked_sessions WHERE sid = ?", (sid,)).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def validate_session(token: str) -> dict:
+    """Return the token claims, or raise TokenError if the session is
+    missing, invalid, expired or has been logged out."""
+    claims = decode_token(token)
+    sid = claims.get("sid")
+    if sid and _is_revoked(sid):
+        raise TokenError("Session expired")
+    return claims
+
+
+def revoke_session(token: str) -> None:
+    """Log out: make this session's token (and its refreshed copies) unusable."""
+    try:
+        claims = decode_token(token)
+    except TokenError:
+        return  # already expired/invalid - nothing to revoke
+    sid = claims.get("sid")
+    if not sid:
+        return
+    conn = get_db()
+    try:
+        now = int(time.time())
+        conn.execute("DELETE FROM revoked_sessions WHERE expires_at < ?", (now,))
+        conn.execute(
+            "INSERT OR IGNORE INTO revoked_sessions (sid, username, expires_at) VALUES (?, ?, ?)",
+            (sid, claims.get("sub", ""), int(claims.get("exp", now)))
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def refresh_session_token(token: str) -> dict:
+    """Sliding session: issue a fresh token for the same session.
+    Raises TokenError if the session is no longer valid."""
+    claims = validate_session(token)
+    return {
+        "username": claims["sub"],
+        "token": create_token(claims["sub"], sid=claims.get("sid")),
+        "expires_in": SESSION_TIMEOUT_MINUTES * 60,
+    }
+
+
+def resume_session(token: str, ip=None) -> dict:
+    """Return to an existing session using a saved token (no password needed).
+    Returns {username, token, expires_in} or raises AuthError(401)."""
+    try:
+        result = refresh_session_token(token)
+    except TokenError as error:
+        record_event("(unknown)", "session_resume_failed", False, ip)
+        raise AuthError(401, str(error))
+
+    username = result["username"]
+    if not user_exists(username):
+        record_event(username, "session_resume_failed", False, ip)
+        raise AuthError(401, "Invalid session")
+
+    record_event(username, "session_resumed", True, ip)
+    return result

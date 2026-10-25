@@ -1,12 +1,14 @@
 import json
 import socket
 import threading
+import time
 import uuid
 
 from database import init_db
-from security import SESSION_TIMEOUT_MINUTES
+from security import SESSION_TIMEOUT_MINUTES, TokenError
 from auth_service import (
-    AuthError, register_account, authenticate, record_event, user_exists
+    AuthError, register_account, authenticate, record_event, user_exists,
+    resume_session, refresh_session_token, revoke_session,
 )
 
 HOST = "127.0.0.1"
@@ -15,6 +17,10 @@ PORT = 5000
 # Seconds a connection may stay unauthenticated, and max auth messages per connection.
 AUTH_TIMEOUT_SECONDS = 300
 MAX_AUTH_MESSAGES = 20
+
+# While a client is active, hand it a fresh session token at most this often (FR-03),
+# so the token it saved on disk stays valid for a restart.
+SESSION_REFRESH_SECONDS = 60
 
 clients = {}
 active_chats = {}
@@ -60,9 +66,10 @@ def authenticate_connection(connection, reader, address):
     Registration / login phase. The client sends one JSON event per line:
       {"type": "register", "username": ..., "email": ..., "password": ...}
       {"type": "login", "username": ..., "password": ...}
+      {"type": "resume", "token": ...}      (return to a saved session)
       {"type": "quit"}
-    Returns the authenticated username, or None if the client leaves or
-    exceeds the allowed number of attempts.
+    Returns (username, session_token, resumed), or (None, None, False) if the
+    client leaves or exceeds the allowed number of attempts.
     """
     send_text(connection, "Welcome! Please log in or register.")
 
@@ -70,7 +77,7 @@ def authenticate_connection(connection, reader, address):
         line = reader.readline()
 
         if not line:
-            return None
+            return None, None, False
 
         try:
             event = json.loads(line)
@@ -109,10 +116,22 @@ def authenticate_connection(connection, reader, address):
                     token=result["token"],
                     expires_in=result["expires_in"]
                 )
-                return result["username"]
+                return result["username"], result["token"], False
+
+            elif event_type == "resume":
+                ip = address[0] if address else None
+                token = event.get("token")
+                result = resume_session(token if isinstance(token, str) else "", ip)
+                send_auth_result(
+                    connection, True, "resume", "Session restored.",
+                    username=result["username"],
+                    token=result["token"],
+                    expires_in=result["expires_in"]
+                )
+                return result["username"], result["token"], True
 
             elif event_type == "quit":
-                return None
+                return None, None, False
 
             else:
                 send_auth_result(
@@ -127,7 +146,7 @@ def authenticate_connection(connection, reader, address):
             )
 
     send_text(connection, "Too many attempts. Disconnecting.")
-    return None
+    return None, None, False
 
 
 def send_status(username, message_id, status, message=None):
@@ -1025,6 +1044,9 @@ def handle_command(connection, username, command):
 def handle_client(connection, address):
     username = None
     reader = None
+    session_token = None
+    owns_session = False
+    last_refresh = time.time()
 
     print(f"Connection received: {address}")
 
@@ -1033,20 +1055,40 @@ def handle_client(connection, address):
 
         # --- Registration / login phase ---
         connection.settimeout(AUTH_TIMEOUT_SECONDS)
-        username = authenticate_connection(connection, reader, address)
+        username, session_token, resumed = authenticate_connection(connection, reader, address)
+        last_refresh = time.time()
 
         if not username:
             return
 
+        stale_connection = None
+
         with clients_lock:
             if username in clients:
-                send_text(connection, "ERROR: Username already in use.")
-                username = None  # do not clean up the other session's state
-                return
+                if not resumed:
+                    send_text(connection, "ERROR: Username already in use.")
+                    username = None  # do not clean up the other session's state
+                    return
+
+                # A valid saved session was resumed (e.g. the app was closed and
+                # reopened before the server noticed the old socket closing).
+                # The old connection belongs to the same session, so replace it.
+                stale_connection = clients[username]
 
             clients[username] = connection
+            owns_session = True
             user_groups.setdefault(username, set())
             offline_messages.setdefault(username, [])
+
+        if stale_connection is not None:
+            send_text(
+                stale_connection,
+                "This session was resumed from another connection."
+            )
+            try:
+                stale_connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
         # Idle timeout: the session ends after SESSION_TIMEOUT_MINUTES without activity.
         connection.settimeout(SESSION_TIMEOUT_MINUTES * 60)
@@ -1084,6 +1126,24 @@ def handle_client(connection, address):
 
             event_type = event.get("type")
 
+            # Sliding session: keep the client's saved token fresh while it is active.
+            if time.time() - last_refresh >= SESSION_REFRESH_SECONDS:
+                last_refresh = time.time()
+                try:
+                    renewed = refresh_session_token(session_token)
+                    session_token = renewed["token"]
+                    send_event(connection, {
+                        "type": "session",
+                        "token": renewed["token"],
+                        "expires_in": renewed["expires_in"]
+                    })
+                except TokenError:
+                    send_text(
+                        connection,
+                        "Session expired. Please log in again."
+                    )
+                    break
+
             if event_type == "chat":
                 handle_chat(username, event)
 
@@ -1104,6 +1164,15 @@ def handle_client(connection, address):
                     })
 
             elif event_type == "command":
+                if event.get("message", "").strip() == "/logout":
+                    # Explicit logout ends the saved session as well.
+                    revoke_session(session_token)
+                    send_event(connection, {
+                        "type": "logged_out",
+                        "message": "You have been logged out."
+                    })
+                    break
+
                 try:
                     handle_command(
                         connection,
@@ -1128,10 +1197,13 @@ def handle_client(connection, address):
 
     finally:
         with clients_lock:
-            if username and clients.get(username) is connection:
+            # A connection replaced by a resumed session no longer owns the user's state.
+            owns_session = bool(username) and clients.get(username) is connection
+
+            if owns_session:
                 del clients[username]
 
-            if username:
+            if owns_session:
                 target = active_chats.pop(username, None)
 
                 if target and active_chats.get(target) == username:
@@ -1139,7 +1211,7 @@ def handle_client(connection, address):
 
                 active_groups.pop(username, None)
 
-        if username:
+        if owns_session:
             try:
                 record_event(username, "logout", True, address[0] if address else None)
             except Exception as error:
