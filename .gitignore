@@ -17,3 +17,4 @@ Thumbs.db
 .pytest_cache/
 .chat_session
 .vapid_private.pem
+App/logs/
