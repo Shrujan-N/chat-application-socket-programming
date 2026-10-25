@@ -116,6 +116,39 @@ def init_db():
     );
     """)
 
+    # Push notifications (FR-19): one row per subscribed browser/device.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+        endpoint TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        user_agent TEXT,
+        created_at TEXT NOT NULL
+    );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(username)")
+
+    # Muted chats/contacts: no push notification for messages from `muted_user`.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS muted_chats (
+        username TEXT NOT NULL,
+        muted_user TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (username, muted_user)
+    );
+    """)
+
+    # Which message was already pushed to which device (prevents duplicate notifications).
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS push_log (
+        msg_id TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        sent_at INTEGER NOT NULL,
+        PRIMARY KEY (msg_id, endpoint)
+    );
+    """)
+
     # Pre-seed initial users for testing if database is empty
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:

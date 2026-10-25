@@ -48,6 +48,12 @@
         #profile-picture-actions .hint { flex-basis: 100%; }
         #profile-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 
+        /* --- Push notifications (FR-19) --- */
+        #push-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; background: #1a2332; border-bottom: 1px solid #2e3b52; font-size: 12px; color: #8696a0; }
+        #push-bar[hidden] { display: none; }
+        #push-toggle { padding: 4px 10px; font-size: 11px; background: #6c757d; }
+        #push-toggle:hover { background: #565e64; }
+
         /* --- Login / Registration screen --- */
         #auth-screen { position: fixed; inset: 0; z-index: 2000; background: #121826; display: flex; align-items: center; justify-content: center; padding: 16px; }
         #auth-screen[hidden] { display: none; }
@@ -137,6 +143,10 @@
                 <button onclick="logout()" style="padding: 4px 8px; font-size: 11px; background: #dc3545;">Logout</button>
             </div>
             <button onclick="openAddContactDialog()" style="padding: 5px 10px; font-size: 12px; background: #28a745;">+ Add</button>
+        </div>
+        <div id="push-bar" hidden>
+            <span id="push-status"></span>
+            <button id="push-toggle" type="button" onclick="togglePush()">Turn on</button>
         </div>
         <div class="search-box">
             <input type="text" id="global-search" placeholder="Search contacts or messages..." onkeyup="handleSearch()">
@@ -422,9 +432,11 @@
             document.getElementById('messages-list').innerHTML = '';
             lastActivity = Date.now();
             initWebSocket();
-            loadContacts();
+            loadMuted().finally(loadContacts);   // mute list first so the bell icons are right
             clearInterval(idleTimer);
             idleTimer = setInterval(checkIdle, 10000);
+            initPush();            // FR-19: service worker + subscription
+            openPendingChat();     // opened from a notification while the app was closed
         }
  
         function endSession(message) {
@@ -436,6 +448,10 @@
             storeToken(null);
             profileCache = {};
             lastContacts = [];
+            mutedUsers = new Set();
+            pushActive = false;
+            pushServerReady = false;
+            updatePushUI();
             try { document.getElementById('profile-dialog').close(); } catch (e) {}
             document.getElementById('own-avatar').innerHTML = '';
             document.getElementById('messages-list').innerHTML = '';
@@ -444,6 +460,7 @@
         }
  
         async function logout() {
+            await removeThisDevice();   // this device must not keep receiving the user's notifications
             try { await window.fetch('/api/logout', { method: 'POST' }); } catch (e) {}
             endSession('You have been logged out.');
         }
@@ -495,6 +512,7 @@
         function initWebSocket() {
             const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
             ws = new WebSocket(`${scheme}://${window.location.host}/ws/${currentUser}?token=${encodeURIComponent(authToken)}`);
+            ws.onopen = reportVisibility;
             ws.onmessage = function(event) {
                 const data = JSON.parse(event.data);
                 handleIncomingSignal(data);
@@ -507,6 +525,210 @@
             };
         }
  
+        // ================= Push notifications & mute (FR-19) =================
+        const pushSupported = ('serviceWorker' in navigator) && ('PushManager' in window) && ('Notification' in window);
+        let pushRegistration = null;
+        let pushServerReady = false;     // server has push switched on
+        let pushPublicKey = null;
+        let pushActive = false;          // this device is subscribed for the logged-in user
+        let pushBusy = false;
+        let mutedUsers = new Set();
+        let pendingChat = null;          // chat to open after a notification click while the app was closed
+
+        function pageInFront() {
+            return document.visibilityState === 'visible' && document.hasFocus();
+        }
+
+        // Tell the server whether this page is in front, so it knows when a push is needed.
+        function reportVisibility() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                try { ws.send(JSON.stringify({ type: 'visibility', visible: pageInFront() })); } catch (e) {}
+            }
+        }
+
+        function urlBase64ToUint8Array(base64) {
+            const padded = (base64 + '='.repeat((4 - base64.length % 4) % 4)).replace(/-/g, '+').replace(/_/g, '/');
+            const raw = atob(padded);
+            const out = new Uint8Array(raw.length);
+            for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+            return out;
+        }
+
+        function pushPrefKey() { return 'chat_push_off:' + currentUser; }
+
+        function pushDisabledByUser() {
+            try { return localStorage.getItem(pushPrefKey()) === '1'; } catch (e) { return false; }
+        }
+
+        function setPushDisabledByUser(off) {
+            try { off ? localStorage.setItem(pushPrefKey(), '1') : localStorage.removeItem(pushPrefKey()); } catch (e) {}
+        }
+
+        function updatePushUI() {
+            const bar = document.getElementById('push-bar');
+            if (!bar) return;
+            if (!pushSupported || !pushServerReady || !currentUser) { bar.hidden = true; return; }
+            bar.hidden = false;
+            const status = document.getElementById('push-status');
+            const button = document.getElementById('push-toggle');
+            button.disabled = pushBusy;
+            if (Notification.permission === 'denied') {
+                status.textContent = '🔕 Notifications are blocked in your browser settings.';
+                button.hidden = true;
+                return;
+            }
+            button.hidden = false;
+            if (pushActive) {
+                status.textContent = '🔔 Notifications are on';
+                button.textContent = 'Turn off';
+            } else {
+                status.textContent = '🔕 Notifications are off';
+                button.textContent = 'Turn on';
+            }
+        }
+
+        function sameKey(buffer, bytes) {
+            if (!buffer) return false;
+            const a = new Uint8Array(buffer);
+            if (a.length !== bytes.length) return false;
+            for (let i = 0; i < a.length; i++) if (a[i] !== bytes[i]) return false;
+            return true;
+        }
+
+        // Make sure this browser has a push subscription and the server knows about it.
+        async function subscribeThisDevice() {
+            const registration = pushRegistration || await navigator.serviceWorker.ready;
+            const key = urlBase64ToUint8Array(pushPublicKey);
+            let subscription = await registration.pushManager.getSubscription();
+            if (subscription && !sameKey(subscription.options && subscription.options.applicationServerKey, key)) {
+                await subscription.unsubscribe();        // made for an older server key
+                subscription = null;
+            }
+            if (!subscription) {
+                subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+            }
+            await postJson('/api/push/subscribe', subscription.toJSON());
+            return subscription;
+        }
+
+        // Forget this device on the server and in the browser.
+        async function removeThisDevice() {
+            if (!pushSupported) return;
+            try {
+                const registration = pushRegistration || await navigator.serviceWorker.getRegistration();
+                const subscription = registration ? await registration.pushManager.getSubscription() : null;
+                if (!subscription) return;
+                try {
+                    await window.fetch('/api/push/unsubscribe', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ endpoint: subscription.endpoint })
+                    });
+                } catch (e) {}
+                await subscription.unsubscribe();
+            } catch (e) {}
+        }
+
+        async function initPush() {
+            pushActive = false;
+            if (!pushSupported || window.location.protocol === 'file:') { updatePushUI(); return; }
+            try {
+                pushRegistration = await navigator.serviceWorker.register('/sw.js');
+                await navigator.serviceWorker.ready;
+                const response = await fetch('/api/push/public-key');
+                const info = response.ok ? await response.json() : {};
+                pushServerReady = !!(info.enabled && info.public_key);
+                pushPublicKey = info.public_key || null;
+                // Already allowed before (and not switched off by the user): subscribe silently.
+                if (pushServerReady && Notification.permission === 'granted' && !pushDisabledByUser()) {
+                    await subscribeThisDevice();
+                    pushActive = true;
+                }
+            } catch (error) {
+                console.warn('Push notifications unavailable:', error);
+            }
+            updatePushUI();
+        }
+
+        async function togglePush() {
+            if (pushBusy || !pushServerReady) return;
+            pushBusy = true;
+            updatePushUI();
+            try {
+                if (pushActive) {
+                    setPushDisabledByUser(true);
+                    await removeThisDevice();
+                    pushActive = false;
+                } else {
+                    const permission = Notification.permission === 'granted'
+                        ? 'granted' : await Notification.requestPermission();
+                    if (permission !== 'granted') return;
+                    setPushDisabledByUser(false);
+                    await subscribeThisDevice();
+                    pushActive = true;
+                    window.fetch('/api/push/test', { method: 'POST' }).catch(function () {});   // proves it works
+                }
+            } catch (error) {
+                alert('Could not change notifications: ' + error.message);
+            } finally {
+                pushBusy = false;
+                updatePushUI();
+            }
+        }
+
+        async function loadMuted() {
+            try {
+                const response = await fetch('/api/mute');
+                if (response.ok) {
+                    const data = await response.json();
+                    mutedUsers = new Set(data.muted || []);
+                }
+            } catch (e) {}
+        }
+
+        async function toggleMute(username) {
+            try {
+                const data = await postJson('/api/mute', { username: username, muted: !mutedUsers.has(username) });
+                mutedUsers = new Set(data.muted || []);
+            } catch (error) {
+                alert(error.message);
+                return;
+            }
+            if (!document.getElementById('global-search').value.trim()) renderContactsList();
+            updateChatHeader();
+        }
+
+        function captureChatLink() {
+            const match = window.location.hash.match(/^#chat=([A-Za-z0-9_]{1,30})$/);
+            if (!match) return;
+            pendingChat = match[1];
+            history.replaceState(null, '', window.location.pathname);
+        }
+
+        function openPendingChat() {
+            if (pendingChat && currentUser) {
+                const contact = pendingChat;
+                pendingChat = null;
+                selectContact(contact);
+            }
+        }
+
+        function initPushListeners() {
+            document.addEventListener('visibilitychange', reportVisibility);
+            window.addEventListener('focus', reportVisibility);
+            window.addEventListener('blur', reportVisibility);
+            if (pushSupported) {
+                // A notification was clicked while the app was open: jump to that chat.
+                navigator.serviceWorker.addEventListener('message', function (event) {
+                    const data = event.data || {};
+                    if (data.type === 'open_chat' && data.sender && currentUser) {
+                        window.focus();
+                        selectContact(data.sender);
+                    }
+                });
+            }
+        }
+
         // ================= Profile management (FR-05) =================
         const MAX_AVATAR_BYTES = 2 * 1024 * 1024;   // server enforces its own limit too
         let profileCache = {};
@@ -559,6 +781,7 @@
             let text = `Chatting with: ${profile.display_name}`;
             if (profile.display_name !== activeContact) text += ` (@${activeContact})`;
             if (profile.bio) text += ` - ${profile.bio}`;
+            if (mutedUsers.has(activeContact)) text += ' 🔕 (muted)';
             document.getElementById('chat-header').innerText = text;
         }
 
@@ -783,6 +1006,7 @@
                             ${profile.bio ? `<span class="contact-bio">${escapeHtml(profile.bio)}</span>` : ''}
                         </span>
                     </span>
+                    <button onclick="toggleMute('${contact}')" style="background:none; border:none; cursor:pointer; font-size:14px;" title="${mutedUsers.has(contact) ? 'Unmute notifications' : 'Mute notifications'}">${mutedUsers.has(contact) ? '🔕' : '🔔'}</button>
                     <button onclick="removeContact('${contact}')" style="background:none; border:none; color:#ff4d4d; cursor:pointer; font-size:14px;" title="Remove Contact">❌</button>
                 `;
                 listElement.appendChild(item);
@@ -875,7 +1099,9 @@
                         reader: currentUser
                     }));
                 } else {
-                    alert(`New message from ${data.sender}!`);
+                    if (!mutedUsers.has(data.sender) && !(pushActive && !pageInFront())) {
+                        alert(`New message from ${data.sender}!`);
+                    }
                 }
             }
             // Update Checkmark Visual State (ADDED FOR ISSUE #22)
@@ -1157,6 +1383,8 @@
         window.onload = function() {
             initDragAndDrop();
             initImageEventDelegation();
+            captureChatLink();      // FR-19: #chat=user from a notification click
+            initPushListeners();
             ['mousemove', 'keydown', 'click', 'touchstart', 'scroll'].forEach(name =>
                 document.addEventListener(name, trackActivity, { passive: true, capture: true })
             );

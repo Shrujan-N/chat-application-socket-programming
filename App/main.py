@@ -1,6 +1,7 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+import asyncio
 import os
 import re
 import math
@@ -20,6 +21,7 @@ from auth_service import (
     reset_password, check_reset_token, RESET_REQUEST_MESSAGE,
 )
 import profile_service
+import push_service
  
  
 class RegisterSchema(BaseModel):
@@ -49,6 +51,21 @@ class ResetPasswordSchema(BaseModel):
 class ProfileUpdateSchema(BaseModel):
     display_name: Optional[str] = None
     bio: Optional[str] = None
+
+
+class PushSubscribeSchema(BaseModel):
+    endpoint: str = ""
+    keys: Dict[str, str] = {}
+    expirationTime: Optional[float] = None
+
+
+class PushUnsubscribeSchema(BaseModel):
+    endpoint: str = ""
+
+
+class MuteSchema(BaseModel):
+    username: str = ""
+    muted: bool = True
  
  
 MAX_FAILED_ATTEMPTS = 5
@@ -376,14 +393,18 @@ async def logout_user(request: Request):
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
+        # True while the user's chat page is in front (reported by the page itself, FR-19)
+        self.visible: Dict[str, bool] = {}
  
     async def connect(self, username: str, websocket: WebSocket):
         await websocket.accept()
         self.active_connections[username] = websocket
+        self.visible[username] = True
  
     def disconnect(self, username: str):
         if username in self.active_connections:
             del self.active_connections[username]
+        self.visible.pop(username, None)
  
 manager = ConnectionManager()
  
@@ -432,7 +453,17 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     await manager.active_connections[recipient].send_json(incoming_frame)
                     # Send 'delivered' status ACK back to sender (ADDED FOR ISSUE #22)
                     await websocket.send_json({"type": "status_update", "msg_id": msg_id, "status": "delivered"})
+
+                # Push notification (FR-19): the recipient is offline, or their chat
+                # page is in the background, so tell their device about the message.
+                if recipient and (recipient not in manager.active_connections
+                                  or not manager.visible.get(recipient, True)):
+                    schedule_push(msg_id, username, recipient, content)
  
+            # The page tells the server whether it is in front (FR-19)
+            elif data.get("type") == "visibility":
+                manager.visible[username] = bool(data.get("visible"))
+
             # Handle Read Receipt ACK frames from recipient (ADDED FOR ISSUE #22)
             elif data.get("type") == "read_ack":
                 sender = data.get("sender")
@@ -526,6 +557,99 @@ async def delete_my_avatar(request: Request):
         raise HTTPException(status_code=error.status_code, detail=error.detail)
     await broadcast_profile(username, profile)
     return {"success": True, "message": "Profile picture removed.", "profile": profile}
+
+
+# --- Push Notifications & Mute (FR-19) ---
+_background_tasks = set()
+
+
+def schedule_push(msg_id, sender, recipient, content):
+    """Send the push in the background so chatting is never slowed down."""
+    async def run():
+        try:
+            await run_in_threadpool(
+                push_service.notify_new_message, msg_id, sender, recipient, content
+            )
+        except Exception as error:
+            print(f"Push notification failed: {error}")
+
+    task = asyncio.create_task(run())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+@app.get("/sw.js")
+async def service_worker():
+    """The service worker must be served from the site root to control the whole app."""
+    path = os.path.join(STATIC_DIR, "sw.js")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Service worker not found")
+    with open(path, "r", encoding="utf-8") as f:
+        body = f.read()
+    return Response(
+        content=body,
+        media_type="application/javascript",
+        headers={"Service-Worker-Allowed": "/", "Cache-Control": "no-cache"}
+    )
+
+
+@app.get("/api/push/public-key")
+async def push_public_key():
+    enabled = await run_in_threadpool(push_service.is_enabled)
+    return {
+        "enabled": enabled,
+        "public_key": push_service.get_public_key() if enabled else None
+    }
+
+
+@app.post("/api/push/subscribe")
+async def push_subscribe(payload: PushSubscribeSchema, request: Request):
+    username = current_username(request)
+    try:
+        await run_in_threadpool(
+            push_service.save_subscription, username, payload.endpoint, payload.keys,
+            request.headers.get("user-agent"), client_ip(request)
+        )
+    except AuthError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail)
+    return {"success": True, "message": "Notifications enabled on this device."}
+
+
+@app.post("/api/push/unsubscribe")
+async def push_unsubscribe(payload: PushUnsubscribeSchema, request: Request):
+    username = current_username(request)
+    try:
+        await run_in_threadpool(
+            push_service.remove_subscription, username, payload.endpoint, client_ip(request)
+        )
+    except AuthError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail)
+    return {"success": True, "message": "Notifications disabled on this device."}
+
+
+@app.post("/api/push/test")
+async def push_test(request: Request):
+    username = current_username(request)
+    sent = await run_in_threadpool(push_service.send_test, username)
+    return {"success": True, "sent": sent}
+
+
+@app.get("/api/mute")
+async def get_muted(request: Request):
+    username = current_username(request)
+    return {"muted": await run_in_threadpool(push_service.list_muted, username)}
+
+
+@app.post("/api/mute")
+async def set_muted(payload: MuteSchema, request: Request):
+    username = current_username(request)
+    try:
+        muted = await run_in_threadpool(
+            push_service.set_muted, username, payload.username, payload.muted
+        )
+    except AuthError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail)
+    return {"success": True, "muted": muted}
 
 
 # --- Contact Management API Endpoints (ADDED FOR ISSUE #17) ---
