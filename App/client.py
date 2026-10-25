@@ -393,6 +393,8 @@ def authenticate(client, reader):
         print("\n1) Log in")
         print("2) Register")
         print("3) Quit")
+        print("4) Forgot password")
+        print("5) Reset password (I have a reset code)")
 
         try:
             choice = input("Choose an option: ").strip().lower()
@@ -417,6 +419,28 @@ def authenticate(client, reader):
                 "password": password
             })
 
+        elif choice in ("4", "forgot", "forgot password"):
+            email = input("Registered email: ").strip()
+            send_event(client, {
+                "type": "forgot_password",
+                "email": email
+            })
+
+        elif choice in ("5", "reset", "reset password"):
+            token = input("Reset code from the email: ").strip()
+            new_password = getpass.getpass("New password: ")
+            confirm = getpass.getpass("Confirm new password: ")
+
+            if new_password != confirm:
+                print("Passwords do not match.")
+                continue
+
+            send_event(client, {
+                "type": "reset_password",
+                "token": token,
+                "new_password": new_password
+            })
+
         elif choice in ("1", "login", "log in"):
             username = input("Username: ").strip()
             password = getpass.getpass("Password: ")
@@ -427,7 +451,7 @@ def authenticate(client, reader):
             })
 
         else:
-            print("Invalid option. Enter 1, 2 or 3.")
+            print("Invalid option. Enter 1, 2, 3, 4 or 5.")
             continue
 
         result = read_event(reader)

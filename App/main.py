@@ -14,7 +14,11 @@ from security import (
     hash_password, verify_password, create_token, decode_token,
     TokenError, SESSION_TIMEOUT_MINUTES,
 )
-from auth_service import validate_session, revoke_session
+from starlette.concurrency import run_in_threadpool
+from auth_service import (
+    validate_session, revoke_session, AuthError, request_password_reset,
+    reset_password, check_reset_token, RESET_REQUEST_MESSAGE,
+)
  
  
 class RegisterSchema(BaseModel):
@@ -26,11 +30,27 @@ class RegisterSchema(BaseModel):
 class LoginSchema(BaseModel):
     username: str = ""
     password: str = ""
+
+
+class ForgotPasswordSchema(BaseModel):
+    email: str = ""
+
+
+class VerifyResetSchema(BaseModel):
+    token: str = ""
+
+
+class ResetPasswordSchema(BaseModel):
+    token: str = ""
+    new_password: str = ""
  
  
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_MINUTES = int(os.environ.get("LOCKOUT_MINUTES", "15"))
-PUBLIC_API_PATHS = {"/api/register", "/api/login"}
+PUBLIC_API_PATHS = {
+    "/api/register", "/api/login",
+    "/api/password/forgot", "/api/password/verify", "/api/password/reset",
+}
  
 app = FastAPI(title="Chat Application - Socket Programming")
 import asyncio
@@ -285,6 +305,37 @@ async def login_user(payload: LoginSchema, request: Request):
         conn.close()
  
  
+# --- Password Recovery (FR-04) ---
+@app.post("/api/password/forgot")
+async def forgot_password(payload: ForgotPasswordSchema, request: Request):
+    ip = request.client.host if request.client else None
+    try:
+        # Same answer whether or not the email has an account.
+        await run_in_threadpool(request_password_reset, payload.email, ip)
+    except AuthError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail)
+    return {"success": True, "message": RESET_REQUEST_MESSAGE}
+
+
+@app.post("/api/password/verify")
+async def verify_reset_link(payload: VerifyResetSchema):
+    """Lets the reset page reject an expired or used link before asking for a password."""
+    return {"valid": check_reset_token(payload.token)}
+
+
+@app.post("/api/password/reset")
+async def reset_user_password(payload: ResetPasswordSchema, request: Request):
+    ip = request.client.host if request.client else None
+    try:
+        await run_in_threadpool(reset_password, payload.token, payload.new_password, ip)
+    except AuthError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail)
+    return {
+        "success": True,
+        "message": "Password reset successful. You can now log in with your new password."
+    }
+
+
 # --- Session refresh (sliding idle timeout) and logout ---
 @app.get("/api/session")
 async def refresh_session(request: Request):

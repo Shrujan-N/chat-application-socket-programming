@@ -15,3 +15,4 @@ Thumbs.db
 .jwt_secret
 .env
 .pytest_cache/
+.chat_session
