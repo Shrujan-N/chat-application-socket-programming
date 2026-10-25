@@ -1,3 +1,5 @@
+import base64
+import binascii
 import json
 import socket
 import threading
@@ -11,6 +13,7 @@ from auth_service import (
     resume_session, refresh_session_token, revoke_session,
     request_password_reset, reset_password, RESET_REQUEST_MESSAGE,
 )
+import profile_service
 
 HOST = "127.0.0.1"
 PORT = 5000
@@ -825,7 +828,163 @@ def handle_delivery(username, message_id):
     send_status(sender, message_id, "delivered")
 
 
+# ------------------------------------------------------------ profiles (FR-05)
+def format_profile(profile):
+    picture = "set" if profile.get("avatar_url") else "none"
+    return (
+        f"Profile for {profile['username']}\n"
+        f"Display name: {profile['display_name']}\n"
+        f"Status: {profile['bio'] or '(empty)'}\n"
+        f"Picture: {picture}"
+    )
+
+
+def notify_profile_change(username, profile):
+    """Tell everyone who can see this user (private-chat partner, group members
+    and accepted contacts) that is online, so the change shows up immediately."""
+    with clients_lock:
+        names = set()
+        partner = active_chats.get(username)
+
+        if partner:
+            names.add(partner)
+
+        for key in user_groups.get(username, set()):
+            group = groups.get(key)
+
+            if group:
+                names.update(group["members"])
+
+        names.discard(username)
+        names_snapshot = set(names)
+
+    try:
+        names_snapshot.update(profile_service.contacts_of(username))
+    except Exception as error:
+        print(f"Could not load contacts for profile update: {error}")
+
+    names_snapshot.discard(username)
+
+    with clients_lock:
+        targets = [clients[n] for n in names_snapshot if n in clients]
+
+    for target in targets:
+        send_event(target, {"type": "profile_update", "profile": profile})
+
+
+def send_profile_result(connection, username, profile, message):
+    send_event(connection, {
+        "type": "profile",
+        "message": message,
+        "profile": profile
+    })
+    notify_profile_change(username, profile)
+
+
+def handle_profile_command(connection, username, command, ip=None):
+    """
+    /profile                      show your profile
+    /profile view <username>      show someone's profile
+    /profile name <display name>  change your display name
+    /profile bio <status text>    change your status/bio
+    /profile clear-bio            clear your status
+    /profile remove-avatar        remove your profile picture
+    (picture upload: the client sends a "profile_avatar" event, see /profile-avatar)
+    """
+    parts = command.split(maxsplit=2)
+    action = parts[1].casefold() if len(parts) > 1 else ""
+    argument = parts[2] if len(parts) > 2 else ""
+
+    try:
+        if action == "":
+            profile = profile_service.get_profile(username)
+            send_text(connection, format_profile(profile))
+
+        elif action == "view":
+            target = argument.strip()
+
+            if not target:
+                send_text(connection, "Usage: /profile view username")
+                return
+
+            send_text(connection, format_profile(profile_service.get_profile(target)))
+
+        elif action == "name":
+            if not argument.strip():
+                send_text(connection, "Usage: /profile name new display name")
+                return
+
+            profile = profile_service.update_profile(username, display_name=argument, ip=ip)
+            send_profile_result(connection, username, profile, "Display name updated.")
+
+        elif action == "bio":
+            if not argument.strip():
+                send_text(
+                    connection,
+                    "Usage: /profile bio your status (use /profile clear-bio to empty it)"
+                )
+                return
+
+            profile = profile_service.update_profile(username, bio=argument, ip=ip)
+            send_profile_result(connection, username, profile, "Status updated.")
+
+        elif action == "clear-bio":
+            profile = profile_service.update_profile(username, bio="", ip=ip)
+            send_profile_result(connection, username, profile, "Status cleared.")
+
+        elif action == "remove-avatar":
+            profile = profile_service.remove_avatar(username, ip=ip)
+            send_profile_result(connection, username, profile, "Profile picture removed.")
+
+        else:
+            send_text(
+                connection,
+                "Profile commands: /profile, /profile view username, "
+                "/profile name text, /profile bio text, /profile clear-bio, "
+                "/profile remove-avatar, /profile-avatar path-to-image"
+            )
+
+    except AuthError as error:
+        send_text(connection, f"Profile not changed: {error.detail}")
+
+
+def handle_profile_avatar(connection, username, event, ip=None):
+    """A client uploads a picture as base64: {"type": "profile_avatar", "data": "..."}."""
+    encoded = event.get("data")
+
+    if not isinstance(encoded, str) or not encoded:
+        send_text(connection, "Profile not changed: no image data received.")
+        return
+
+    # Reject oversized uploads before decoding them.
+    if len(encoded) > (profile_service.MAX_AVATAR_BYTES * 4) // 3 + 8:
+        limit_mb = profile_service.MAX_AVATAR_BYTES / (1024 * 1024)
+        send_text(
+            connection,
+            f"Profile not changed: image is too large. The maximum size is {limit_mb:.0f} MB."
+        )
+        return
+
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        send_text(connection, "Profile not changed: the image data is not valid.")
+        return
+
+    try:
+        profile = profile_service.set_avatar(username, data, ip=ip)
+    except AuthError as error:
+        send_text(connection, f"Profile not changed: {error.detail}")
+        return
+
+    send_profile_result(connection, username, profile, "Profile picture updated.")
+
+
 def handle_command(connection, username, command):
+    if command == "/profile" or command.startswith("/profile "):
+        handle_profile_command(connection, username, command)
+        return
+
     if command.startswith("/edit "):
         handle_edit(connection, username, command)
         return
@@ -1187,6 +1346,12 @@ def handle_client(connection, address):
                         "type": event_type,
                         "username": username
                     })
+
+            elif event_type == "profile_avatar":
+                handle_profile_avatar(
+                    connection, username, event,
+                    address[0] if address else None
+                )
 
             elif event_type == "command":
                 if event.get("message", "").strip() == "/logout":

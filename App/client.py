@@ -1,3 +1,4 @@
+import base64
 import getpass
 import json
 import os
@@ -26,6 +27,10 @@ SESSION_FILE = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".chat_session")
 )
 session_file_lock = threading.Lock()
+
+# FR-05: largest profile picture the server accepts (checked here too so a huge
+# file is never read or sent).
+MAX_AVATAR_BYTES = int(os.environ.get("MAX_AVATAR_BYTES", str(2 * 1024 * 1024)))
 
 
 def save_session(username, token):
@@ -209,6 +214,26 @@ def receive_messages(reader, client, stop_event):
                 print(f"\n{event.get('message', 'You have been logged out.')}")
                 break
 
+            elif event_type == "profile":
+                # Result of one of your own profile changes.
+                profile = event.get("profile", {})
+                print(
+                    f"\n{event.get('message', 'Profile updated.')}\n"
+                    f"Display name: {profile.get('display_name', '')}\n"
+                    f"Status: {profile.get('bio') or '(empty)'}\n"
+                    f"Picture: {'set' if profile.get('avatar_url') else 'none'}"
+                )
+
+            elif event_type == "profile_update":
+                # Someone you can see changed their profile.
+                profile = event.get("profile", {})
+                print(
+                    f"\n[Profile] {profile.get('username', 'Someone')} updated their profile: "
+                    f"{profile.get('display_name', '')} - "
+                    f"{profile.get('bio') or '(no status)'}"
+                    f"{' [picture set]' if profile.get('avatar_url') else ''}"
+                )
+
             elif event_type == "message_edit":
                 message_id = event.get("message_id", "")
                 sender = event.get("sender", "Unknown")
@@ -284,10 +309,12 @@ def is_command(message):
         "/quit",
         "/logout",
         "/help",
-        "/group-help"
+        "/group-help",
+        "/profile"
     }
 
     prefixes = (
+        "/profile ",
         "/edit ",
         "/delete ",
         "/chat ",
@@ -316,6 +343,13 @@ def print_help():
     print("/edit message_id new content      Edit your own message")
     print("/delete message_id me             Delete a message from your view")
     print("/delete message_id everyone       Delete your message for everyone")
+    print("/profile                          View your profile")
+    print("/profile view username            View someone's profile")
+    print("/profile name new display name    Change your display name")
+    print("/profile bio your status          Change your status/bio")
+    print("/profile clear-bio                Clear your status")
+    print("/profile-avatar path/to/image     Set your profile picture (PNG/JPEG/GIF/WebP)")
+    print("/profile remove-avatar            Remove your profile picture")
     print("/help                             Show commands")
     print("/quit                             Disconnect (you stay logged in)")
     print("/logout                           Log out and forget the saved session")
@@ -471,6 +505,43 @@ def authenticate(client, reader):
             return result.get("username")
 
 
+def send_avatar(client, path_text):
+    """Read a local image and send it to the server as the profile picture."""
+    path = os.path.expanduser(path_text.strip().strip('"').strip("'"))
+
+    if not path:
+        print("Usage: /profile-avatar path/to/image")
+        return
+
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        print(f"Profile not changed: cannot read '{path}'.")
+        return
+
+    if size > MAX_AVATAR_BYTES:
+        print(
+            f"Profile not changed: image is too large ({size / (1024 * 1024):.1f} MB). "
+            f"The maximum size is {MAX_AVATAR_BYTES / (1024 * 1024):.0f} MB."
+        )
+        return
+
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        print(f"Profile not changed: cannot read '{path}'.")
+        return
+
+    try:
+        send_event(client, {
+            "type": "profile_avatar",
+            "data": base64.b64encode(data).decode("ascii")
+        })
+    except OSError:
+        print("Could not send the picture.")
+
+
 def start_client():
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     reader = None
@@ -568,6 +639,10 @@ def start_client():
 
             if message == "/help":
                 print_help()
+                continue
+
+            if message.lower() == "/profile-avatar" or message.lower().startswith("/profile-avatar "):
+                send_avatar(client, message[len("/profile-avatar"):])
                 continue
 
             if is_command(message):

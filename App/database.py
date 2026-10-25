@@ -104,6 +104,18 @@ def init_db():
     );
     """)
     
+    # User profiles (FR-05): display name, status/bio and profile picture file name.
+    # A user with no row here simply shows their username and no picture.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS profiles (
+        username TEXT PRIMARY KEY,
+        display_name TEXT,
+        bio TEXT NOT NULL DEFAULT '',
+        avatar TEXT,
+        updated_at TEXT NOT NULL
+    );
+    """)
+
     # Pre-seed initial users for testing if database is empty
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:

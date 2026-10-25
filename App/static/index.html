@@ -31,6 +31,23 @@
         #add-contact-actions { display: flex; justify-content: flex-end; gap: 8px; }
         #add-contact-error { color: #ff8080; font-size: 13px; }
  
+        /* --- Profiles (FR-05) --- */
+        .avatar { border-radius: 50%; object-fit: cover; background: #2c3a52; flex: none; display: inline-flex; align-items: center; justify-content: center; color: #fff; font-weight: bold; overflow: hidden; }
+        .contact-main { flex: 1; display: flex; align-items: center; gap: 10px; min-width: 0; }
+        .contact-text { display: flex; flex-direction: column; min-width: 0; }
+        .contact-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .contact-bio { font-size: 11px; color: #8696a0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .contact-item.active .contact-bio { color: #dbe9ff; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        #current-user-label { max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
+        #own-avatar { cursor: pointer; display: inline-flex; }
+        #profile-dialog { width: min(420px, calc(100% - 32px)); margin: auto; padding: 20px; border: 1px solid #2e3b52; border-radius: 8px; background: #1a2332; color: #fff; }
+        #profile-dialog::backdrop { background: rgba(0, 0, 0, 0.7); }
+        #profile-picture-row { display: flex; align-items: center; gap: 16px; margin-bottom: 6px; }
+        #profile-picture-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+        #profile-picture-actions .hint { flex-basis: 100%; }
+        #profile-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+
         /* --- Login / Registration screen --- */
         #auth-screen { position: fixed; inset: 0; z-index: 2000; background: #121826; display: flex; align-items: center; justify-content: center; padding: 16px; }
         #auth-screen[hidden] { display: none; }
@@ -114,7 +131,9 @@
     <div id="sidebar">
         <div class="header">
             <div style="display:flex; align-items:center; gap:8px;">
-                <span style="font-size:13px;">User: <b id="current-user-label"></b></span>
+                <span id="own-avatar" onclick="openProfileDialog()" title="Edit your profile"></span>
+                <span style="font-size:13px;"><b id="current-user-label"></b></span>
+                <button onclick="openProfileDialog()" style="padding: 4px 8px; font-size: 11px;">Profile</button>
                 <button onclick="logout()" style="padding: 4px 8px; font-size: 11px; background: #dc3545;">Logout</button>
             </div>
             <button onclick="openAddContactDialog()" style="padding: 5px 10px; font-size: 12px; background: #28a745;">+ Add</button>
@@ -149,6 +168,34 @@
         </form>
     </dialog>
  
+    <!-- Profile management (FR-05) -->
+    <dialog id="profile-dialog">
+        <form id="profile-form" class="auth-form" onsubmit="saveProfile(event)" novalidate>
+            <h2>Your profile</h2>
+            <div id="profile-picture-row">
+                <span id="profile-avatar-preview"></span>
+                <div id="profile-picture-actions">
+                    <input type="file" id="profile-avatar-input" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none;" onchange="uploadAvatar()">
+                    <button type="button" onclick="document.getElementById('profile-avatar-input').click()">Upload picture</button>
+                    <button type="button" id="profile-remove-avatar" onclick="removeAvatar()" style="background:#dc3545;">Remove picture</button>
+                    <p class="hint">PNG, JPEG, GIF or WebP, up to 2 MB.</p>
+                </div>
+            </div>
+            <label for="profile-display-name">Display name</label>
+            <input id="profile-display-name" type="text" autocomplete="off">
+            <p class="hint">Up to 50 characters: letters, numbers, spaces and . _ ' -</p>
+            <label for="profile-bio">Status</label>
+            <input id="profile-bio" type="text" autocomplete="off" oninput="updateBioCounter()">
+            <p class="hint" id="profile-bio-count">0/150</p>
+            <p id="profile-info" class="auth-info" role="status" hidden></p>
+            <p id="profile-error" class="auth-error" role="alert" hidden></p>
+            <div id="profile-actions">
+                <button type="button" onclick="closeProfileDialog()">Close</button>
+                <button id="profile-save" type="submit" style="background:#28a745;">Save changes</button>
+            </div>
+        </form>
+    </dialog>
+
     <!-- High Z-Index Isolated Lightbox Modal (FIXED FOR ISSUE #29) -->
     <div id="image-modal" onclick="closeModal(event)" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.92); z-index:999999; justify-content:center; align-items:center; cursor:pointer;">
         <span onclick="closeModal(event)" style="position:absolute; top:20px; right:30px; font-size:40px; color:#ffffff; font-weight:bold; cursor:pointer; z-index:1000000; user-select:none;">&times;</span>
@@ -387,6 +434,10 @@
             currentUser = null;
             activeContact = null;
             storeToken(null);
+            profileCache = {};
+            lastContacts = [];
+            try { document.getElementById('profile-dialog').close(); } catch (e) {}
+            document.getElementById('own-avatar').innerHTML = '';
             document.getElementById('messages-list').innerHTML = '';
             document.getElementById('contacts-list').innerHTML = '';
             showLoginScreen(message);
@@ -456,6 +507,178 @@
             };
         }
  
+        // ================= Profile management (FR-05) =================
+        const MAX_AVATAR_BYTES = 2 * 1024 * 1024;   // server enforces its own limit too
+        let profileCache = {};
+        let lastContacts = [];
+
+        function escapeHtml(text) {
+            return String(text == null ? '' : text).replace(/[&<>"']/g, c => (
+                { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+            ));
+        }
+
+        function profileFor(username) {
+            return profileCache[username] || { username: username, display_name: username, bio: '', avatar_url: null };
+        }
+
+        function displayNameOf(username) {
+            return profileFor(username).display_name || username;
+        }
+
+        function avatarHTML(username, size) {
+            const profile = profileFor(username);
+            const style = `width:${size}px;height:${size}px;font-size:${Math.round(size * 0.45)}px;`;
+            if (profile.avatar_url) {
+                return `<img class="avatar" src="${escapeHtml(profile.avatar_url)}" alt="" style="${style}">`;
+            }
+            const initial = escapeHtml((profile.display_name || username).trim().charAt(0).toUpperCase() || '?');
+            return `<span class="avatar" style="${style}">${initial}</span>`;
+        }
+
+        async function loadProfiles(usernames) {
+            const names = [...new Set(usernames.filter(Boolean))];
+            if (names.length === 0) return;
+            try {
+                const response = await fetch('/api/profiles?users=' + encodeURIComponent(names.join(',')));
+                if (!response.ok) return;
+                const data = await response.json();
+                (data.profiles || []).forEach(p => { profileCache[p.username] = p; });
+            } catch (e) {}
+        }
+
+        function renderOwnProfile() {
+            if (!currentUser) return;
+            document.getElementById('current-user-label').textContent = displayNameOf(currentUser);
+            document.getElementById('own-avatar').innerHTML = avatarHTML(currentUser, 28);
+        }
+
+        function updateChatHeader() {
+            if (!activeContact) return;
+            const profile = profileFor(activeContact);
+            let text = `Chatting with: ${profile.display_name}`;
+            if (profile.display_name !== activeContact) text += ` (@${activeContact})`;
+            if (profile.bio) text += ` - ${profile.bio}`;
+            document.getElementById('chat-header').innerText = text;
+        }
+
+        async function sendJson(method, url, body) {
+            const response = await window.fetch(url, {
+                method: method,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            return readJsonResult(response);
+        }
+
+        async function readJsonResult(response) {
+            let data = {};
+            try { data = await response.json(); } catch (e) {}
+            if (!response.ok) {
+                const detail = Array.isArray(data.detail) ? 'Please check the form fields.' : data.detail;
+                throw new Error(detail || `Request failed (HTTP ${response.status}).`);
+            }
+            return data;
+        }
+
+        function updateBioCounter() {
+            const length = document.getElementById('profile-bio').value.trim().length;
+            document.getElementById('profile-bio-count').textContent = `${length}/150`;
+        }
+
+        // Show a saved profile in the dialog. The text fields are only overwritten
+        // when the dialog is closed or when force is set, so typing is never lost.
+        function fillProfileDialog(force) {
+            if (!currentUser) return;
+            const dialog = document.getElementById('profile-dialog');
+            const profile = profileFor(currentUser);
+            document.getElementById('profile-avatar-preview').innerHTML = avatarHTML(currentUser, 96);
+            document.getElementById('profile-remove-avatar').disabled = !profile.avatar_url;
+            if (force || !dialog.open) {
+                document.getElementById('profile-display-name').value = profile.display_name;
+                document.getElementById('profile-bio').value = profile.bio;
+                updateBioCounter();
+            }
+        }
+
+        function openProfileDialog() {
+            if (!currentUser) return;
+            setText('profile-error', ''); setText('profile-info', '');
+            fillProfileDialog(true);
+            document.getElementById('profile-dialog').showModal();
+            document.getElementById('profile-display-name').focus();
+        }
+
+        function closeProfileDialog() {
+            document.getElementById('profile-dialog').close();
+        }
+
+        // Store a profile the server confirmed and refresh everything that shows it.
+        function applyOwnProfile(profile) {
+            profileCache[profile.username] = profile;
+            renderOwnProfile();
+            fillProfileDialog(true);
+            renderContactsList();
+            updateChatHeader();
+        }
+
+        async function saveProfile(event) {
+            event.preventDefault();
+            const button = document.getElementById('profile-save');
+            setText('profile-error', ''); setText('profile-info', '');
+            button.disabled = true;
+            try {
+                const data = await sendJson('PUT', '/api/profile', {
+                    display_name: document.getElementById('profile-display-name').value,
+                    bio: document.getElementById('profile-bio').value
+                });
+                applyOwnProfile(data.profile);
+                setText('profile-info', data.message || 'Profile saved.');
+            } catch (error) {
+                setText('profile-error', error.message + ' Your profile was not changed.');
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        async function uploadAvatar() {
+            const input = document.getElementById('profile-avatar-input');
+            const file = input.files && input.files[0];
+            if (!file) return;
+            setText('profile-error', ''); setText('profile-info', '');
+
+            if (file.size > MAX_AVATAR_BYTES) {
+                setText('profile-error', `Image is too large (${(file.size / 1048576).toFixed(1)} MB). The maximum size is 2 MB. Your profile picture was not changed.`);
+                input.value = '';
+                return;
+            }
+
+            const form = new FormData();
+            form.append('file', file);
+            try {
+                const response = await window.fetch('/api/profile/avatar', { method: 'POST', body: form });
+                const data = await readJsonResult(response);
+                applyOwnProfile(data.profile);
+                setText('profile-info', data.message || 'Profile picture updated.');
+            } catch (error) {
+                setText('profile-error', error.message + ' Your profile picture was not changed.');
+            } finally {
+                input.value = '';
+            }
+        }
+
+        async function removeAvatar() {
+            setText('profile-error', ''); setText('profile-info', '');
+            try {
+                const response = await window.fetch('/api/profile/avatar', { method: 'DELETE' });
+                const data = await readJsonResult(response);
+                applyOwnProfile(data.profile);
+                setText('profile-info', data.message || 'Profile picture removed.');
+            } catch (error) {
+                setText('profile-error', error.message);
+            }
+        }
+
         // --- Contact Management JS Functions ---
         function openAddContactDialog() {
             const dialog = document.getElementById('add-contact-dialog');
@@ -526,15 +749,26 @@
             
             const response = await fetch(`/api/contacts/${currentUser}`);
             const data = await response.json();
+            lastContacts = data.contacts || [];
+
+            // Profiles (display name, status, picture) for contacts and for me.
+            await loadProfiles([...lastContacts, currentUser]);
+            renderOwnProfile();
+            updateChatHeader();
+            renderContactsList();
+        }
+
+        function renderContactsList() {
             const listElement = document.getElementById('contacts-list');
             listElement.innerHTML = '';
             
-            if (!data.contacts || data.contacts.length === 0) {
+            if (lastContacts.length === 0) {
                 listElement.innerHTML = '<div style="padding:10px; color:#8696a0; font-size:12px;">No contacts found. Click "+ Add" above to add contacts.</div>';
                 return;
             }
  
-            data.contacts.forEach(contact => {
+            lastContacts.forEach(contact => {
+                const profile = profileFor(contact);
                 const item = document.createElement('div');
                 item.className = `contact-item ${activeContact === contact ? 'active' : ''}`;
                 item.style.display = 'flex';
@@ -542,7 +776,13 @@
                 item.style.alignItems = 'center';
                 
                 item.innerHTML = `
-                    <span onclick="selectContact('${contact}')" style="flex:1;">&#128100; ${contact}</span>
+                    <span class="contact-main" onclick="selectContact('${contact}')" style="cursor:pointer;" title="@${escapeHtml(contact)}">
+                        ${avatarHTML(contact, 36)}
+                        <span class="contact-text">
+                            <span class="contact-name">${escapeHtml(profile.display_name)}</span>
+                            ${profile.bio ? `<span class="contact-bio">${escapeHtml(profile.bio)}</span>` : ''}
+                        </span>
+                    </span>
                     <button onclick="removeContact('${contact}')" style="background:none; border:none; color:#ff4d4d; cursor:pointer; font-size:14px;" title="Remove Contact">❌</button>
                 `;
                 listElement.appendChild(item);
@@ -600,7 +840,7 @@
  
         function selectContact(contact) {
             activeContact = contact;
-            document.getElementById('chat-header').innerText = `Chatting with: ${contact}`;
+            updateChatHeader();
             loadContacts();
             loadHistory(); // Load stored history (ADDED FOR ISSUE #23)
         }
@@ -649,6 +889,16 @@
                         statusElem.className = 'message-status read';
                     }
                 }
+            }
+            // A contact (or I, from another tab) changed a profile (FR-05)
+            else if (data.type === "profile_update" && data.profile) {
+                profileCache[data.profile.username] = data.profile;
+                if (data.profile.username === currentUser) {
+                    renderOwnProfile();
+                    fillProfileDialog();
+                }
+                updateChatHeader();
+                if (!document.getElementById('global-search').value.trim()) renderContactsList();
             }
         }
  
