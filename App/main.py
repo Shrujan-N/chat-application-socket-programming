@@ -2,11 +2,15 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, H
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 import asyncio
+import logging
+import time
 import os
 import re
 import math
 import shutil
 import sqlite3
+from collections import deque
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel
 from typing import Dict, Optional
@@ -104,6 +108,42 @@ STATIC_DIR = os.path.join(APP_DIR, "static")
 UPLOADS_DIR = profile_service.UPLOADS_DIR   # same folder as before (APP_DIR/uploads) unless CHAT_UPLOADS_DIR is set
 
 
+# --- Application logging and request diagnostics (Issue #51) ---
+LOG_DIR = Path(APP_DIR) / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+logger = logging.getLogger("chat_application")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+if not logger.handlers:
+    file_handler = RotatingFileHandler(
+        LOG_DIR / "server.log",
+        maxBytes=1_000_000,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+SERVER_STARTED_AT = time.time()
+REQUEST_METRICS = {
+    "total_requests": 0,
+    "server_errors": 0,
+    "slow_requests": 0,
+    "total_duration_ms": 0.0,
+}
+RECENT_REQUESTS = deque(maxlen=20)
+SLOW_REQUEST_THRESHOLD_SECONDS = 1.5
+
+
 # --- Session protection: every /api route except register/login needs a valid token ---
 def get_bearer_token(request: Request) -> str:
     header = request.headers.get("Authorization", "")
@@ -112,13 +152,102 @@ def get_bearer_token(request: Request) -> str:
  
 @app.middleware("http")
 async def require_session(request: Request, call_next):
+    started = time.perf_counter()
     path = request.url.path
+
     if path.startswith("/api/") and path not in PUBLIC_API_PATHS:
         try:
-            validate_session(get_bearer_token(request))   # also rejects logged-out sessions
-        except TokenError as error:
-            return JSONResponse(status_code=401, content={"detail": str(error)})
-    return await call_next(request)
+            validate_session(get_bearer_token(request))
+        except TokenError:
+            logger.warning(
+                "Rejected unauthenticated API request: method=%s path=%s",
+                request.method,
+                path,
+            )
+            response = JSONResponse(
+                status_code=401,
+                content={"detail": "Authentication required"},
+            )
+            record_request_metric(request.method, path, response.status_code,
+                                  time.perf_counter() - started)
+            return response
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration = time.perf_counter() - started
+        record_request_metric(request.method, path, 500, duration)
+        logger.exception(
+            "Unhandled request error: method=%s path=%s duration_seconds=%.3f",
+            request.method,
+            path,
+            duration,
+        )
+        raise
+
+    duration = time.perf_counter() - started
+    record_request_metric(request.method, path, response.status_code, duration)
+
+    if response.status_code >= 500:
+        logger.error(
+            "HTTP server error: method=%s path=%s status=%s duration_seconds=%.3f",
+            request.method,
+            path,
+            response.status_code,
+            duration,
+        )
+    elif duration >= SLOW_REQUEST_THRESHOLD_SECONDS:
+        logger.warning(
+            "Slow HTTP request: method=%s path=%s status=%s duration_seconds=%.3f",
+            request.method,
+            path,
+            response.status_code,
+            duration,
+        )
+    else:
+        logger.info(
+            "HTTP request: method=%s path=%s status=%s duration_seconds=%.3f",
+            request.method,
+            path,
+            response.status_code,
+            duration,
+        )
+    return response
+
+
+def record_request_metric(method: str, path: str, status: int, duration: float):
+    REQUEST_METRICS["total_requests"] += 1
+    REQUEST_METRICS["total_duration_ms"] += duration * 1000
+
+    if status >= 500:
+        REQUEST_METRICS["server_errors"] += 1
+    if duration >= SLOW_REQUEST_THRESHOLD_SECONDS:
+        REQUEST_METRICS["slow_requests"] += 1
+
+    RECENT_REQUESTS.appendleft({
+        "method": method,
+        "path": path,
+        "status": status,
+        "duration_ms": round(duration * 1000, 2),
+        "timestamp": utc_now().isoformat(),
+    })
+
+
+@app.get("/api/diagnostics/summary")
+async def diagnostics_summary():
+    """Return aggregate diagnostics to an authenticated user; never expose log contents."""
+    total = REQUEST_METRICS["total_requests"]
+    average = REQUEST_METRICS["total_duration_ms"] / total if total else 0.0
+    return {
+        "status": "ok",
+        "uptime_seconds": round(time.time() - SERVER_STARTED_AT, 1),
+        "total_requests": total,
+        "server_errors": REQUEST_METRICS["server_errors"],
+        "slow_requests": REQUEST_METRICS["slow_requests"],
+        "average_response_ms": round(average, 2),
+        "recent_requests": list(RECENT_REQUESTS),
+        "log_file": "Server-side rotating log enabled",
+    }
  
  
 # Mount Static Files and Uploads
@@ -415,9 +544,11 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
     try:
         claims = validate_session(websocket.query_params.get("token", ""))
     except TokenError:
+        logger.warning("Rejected WebSocket connection: invalid session")
         await websocket.close(code=4401)
         return
     if claims.get("sub") != username:
+        logger.warning("Rejected WebSocket connection: username mismatch")
         await websocket.close(code=4403)
         return
  
@@ -476,6 +607,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         "status": "read"
                     })
     except WebSocketDisconnect:
+        logger.info("WebSocket disconnected: username=%s", username)
         manager.disconnect(username)
  
 # --- Profile Management (FR-05) ---
@@ -500,6 +632,7 @@ async def broadcast_profile(username: str, profile: dict):
         try:
             await socket_.send_json(frame)
         except Exception:
+            logger.exception("Profile broadcast failed for an active connection")
             manager.disconnect(name)
 
 
@@ -571,8 +704,8 @@ def schedule_push(msg_id, sender, recipient, content):
             await run_in_threadpool(
                 push_service.notify_new_message, msg_id, sender, recipient, content
             )
-        except Exception as error:
-            print(f"Push notification failed: {error}")
+        except Exception:
+            logger.exception("Push notification task failed")
 
     task = asyncio.create_task(run())
     _background_tasks.add(task)

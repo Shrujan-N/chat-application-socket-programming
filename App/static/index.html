@@ -54,6 +54,10 @@
         #push-toggle { padding: 4px 10px; font-size: 11px; background: #6c757d; }
         #push-toggle:hover { background: #565e64; }
 
+        @media (max-width: 700px) {
+            #sidebar { width: 240px; }
+            #current-user-label { max-width: 55px; }
+        }
         /* --- Login / Registration screen --- */
         #auth-screen { position: fixed; inset: 0; z-index: 2000; background: #121826; display: flex; align-items: center; justify-content: center; padding: 16px; }
         #auth-screen[hidden] { display: none; }
@@ -205,6 +209,8 @@
             </div>
         </form>
     </dialog>
+
+
 
     <!-- High Z-Index Isolated Lightbox Modal (FIXED FOR ISSUE #29) -->
     <div id="image-modal" onclick="closeModal(event)" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.92); z-index:999999; justify-content:center; align-items:center; cursor:pointer;">
