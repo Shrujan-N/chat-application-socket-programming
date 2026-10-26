@@ -30,6 +30,17 @@
         #add-contact-form input { padding: 10px; border: 1px solid #2e3b52; border-radius: 6px; background: #0f141d; color: #fff; }
         #add-contact-actions { display: flex; justify-content: flex-end; gap: 8px; }
         #add-contact-error { color: #ff8080; font-size: 13px; }
+        .onboarding-guide { margin: 14px 12px 6px; padding: 14px; border: 1px solid #2e3b52; border-radius: 8px; background: #1e293b; }
+        .onboarding-guide h2 { font-size: 14px; margin-bottom: 6px; }
+        .onboarding-guide p { color: #b7c4d8; font-size: 12px; line-height: 1.45; margin-bottom: 10px; }
+        .onboarding-guide button { width: 100%; padding: 8px 10px; font-size: 12px; }
+        .user-results { max-height: 220px; overflow-y: auto; border: 1px solid #2e3b52; border-radius: 6px; background: #0f141d; }
+        .user-result { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 10px; border-bottom: 1px solid #232d3f; }
+        .user-result:last-child { border-bottom: 0; }
+        .user-result-name { overflow-wrap: anywhere; font-size: 13px; }
+        .user-result button { padding: 6px 10px; font-size: 11px; flex: none; }
+        .user-result-empty { padding: 10px; color: #8696a0; font-size: 12px; }
+        #add-contact-dialog .hint { line-height: 1.45; }
  
         /* --- Profiles (FR-05) --- */
         .avatar { border-radius: 50%; object-fit: cover; background: #2c3a52; flex: none; display: inline-flex; align-items: center; justify-content: center; color: #fff; font-weight: bold; overflow: hidden; }
@@ -156,6 +167,11 @@
             <input type="text" id="global-search" placeholder="Search contacts or messages..." onkeyup="handleSearch()">
         </div>
         <div id="pending-requests" style="padding: 10px; border-bottom: 1px solid #2e3b52;"></div>
+        <section id="onboarding-guide" class="onboarding-guide" hidden aria-labelledby="onboarding-title">
+            <h2 id="onboarding-title">Start your first chat</h2>
+            <p>Find someone by username, send a contact request, and start chatting when they accept.</p>
+            <button type="button" onclick="openAddContactDialog()">Find people</button>
+        </section>
         <div id="contacts-list"></div>
     </div>
     <div id="chat-area">
@@ -171,9 +187,15 @@
  
     <dialog id="add-contact-dialog">
         <form id="add-contact-form" onsubmit="addContact(event)">
-            <h2>Add a contact</h2>
-            <label for="add-contact-username">Username</label>
-            <input id="add-contact-username" type="text" autocomplete="off" required>
+            <h2>Find people</h2>
+            <p class="hint">Search registered usernames below, or enter a username directly.</p>
+            <label for="user-discovery-search">Find a registered user</label>
+            <input id="user-discovery-search" type="search" autocomplete="off" placeholder="Search usernames..." oninput="renderUserDiscoveryResults()">
+            <div id="user-discovery-results" class="user-results" role="listbox" aria-label="Registered users">
+                <div class="user-result-empty">Loading users…</div>
+            </div>
+            <label for="add-contact-username">Or enter a username</label>
+            <input id="add-contact-username" type="text" autocomplete="off" required placeholder="Exact username">
             <p id="add-contact-error" role="alert" hidden></p>
             <div id="add-contact-actions">
                 <button type="button" onclick="closeAddContactDialog()">Cancel</button>
@@ -508,16 +530,20 @@
             button.disabled = true;
             try {
                 const username = document.getElementById('register-username').value.trim();
-                await postJson('/api/register', {
-                    username: username,
-                    email: document.getElementById('register-email').value,
-                    password: document.getElementById('register-password').value
-                });
-                // Redirect to login after successful registration
+                const email = document.getElementById('register-email').value.trim();
+                const password = document.getElementById('register-password').value;
+                await postJson('/api/register', { username, email, password });
                 document.getElementById('register-form').reset();
-                showLoginScreen('Registration successful. Please log in.');
-                document.getElementById('login-username').value = username;
-                document.getElementById('login-password').focus();
+                try {
+                    const session = await postJson('/api/login', { username, password });
+                    applySession(session);
+                    currentUser = session.username;
+                    startApp();
+                } catch (loginError) {
+                    showLoginScreen('Registration successful. Please log in to continue.');
+                    document.getElementById('login-username').value = username;
+                    document.getElementById('login-password').focus();
+                }
             } catch (error) {
                 setText('register-error', error.message);
             } finally {
@@ -1027,16 +1053,84 @@
         }
 
         // --- Contact Management JS Functions ---
+        let discoverableUsers = [];
+        let discoveryLoadFailed = false;
+
+        function updateOnboardingGuide() {
+            const guide = document.getElementById('onboarding-guide');
+            if (guide) guide.hidden = !currentUser || lastContacts.length > 0;
+        }
+
+        async function loadDiscoverableUsers() {
+            const results = document.getElementById('user-discovery-results');
+            if (!results) return;
+            results.innerHTML = '<div class="user-result-empty">Loading users…</div>';
+            discoveryLoadFailed = false;
+            try {
+                const response = await window.fetch('/api/users');
+                const data = await readJsonResult(response);
+                discoverableUsers = (data.users || [])
+                    .filter(name => name && name !== currentUser && !lastContacts.includes(name))
+                    .sort((a, b) => a.localeCompare(b));
+                renderUserDiscoveryResults();
+            } catch (error) {
+                discoveryLoadFailed = true;
+                results.innerHTML = '<div class="user-result-empty">Could not load users. You can still enter a username below.</div>';
+                console.warn('Could not load registered users for discovery:', error);
+            }
+        }
+
+        function renderUserDiscoveryResults() {
+            const results = document.getElementById('user-discovery-results');
+            const search = document.getElementById('user-discovery-search');
+            if (!results || !search) return;
+            if (discoveryLoadFailed) {
+                results.innerHTML = '<div class="user-result-empty">User search is unavailable. Enter a username below.</div>';
+                return;
+            }
+            const query = search.value.trim().toLowerCase();
+            const matches = discoverableUsers.filter(name => name.toLowerCase().includes(query)).slice(0, 50);
+            results.replaceChildren();
+            if (matches.length === 0) {
+                const empty = document.createElement('div');
+                empty.className = 'user-result-empty';
+                empty.textContent = query ? 'No matching users found. Try another name or enter the exact username below.' : 'No new users to show. You can enter a username below.';
+                results.appendChild(empty);
+                return;
+            }
+            matches.forEach(name => {
+                const row = document.createElement('div');
+                row.className = 'user-result';
+                row.setAttribute('role', 'option');
+                const label = document.createElement('span');
+                label.className = 'user-result-name';
+                label.textContent = '@' + name;
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.textContent = 'Add';
+                button.setAttribute('aria-label', 'Send contact request to ' + name);
+                button.addEventListener('click', () => {
+                    document.getElementById('add-contact-username').value = name;
+                    document.getElementById('add-contact-form').requestSubmit();
+                });
+                row.append(label, button);
+                results.appendChild(row);
+            });
+        }
+
         function openAddContactDialog() {
             const dialog = document.getElementById('add-contact-dialog');
             const errorMessage = document.getElementById('add-contact-error');
             document.getElementById('add-contact-username').value = '';
-            errorMessage.hidden = window.location.protocol !== 'file:';
+            document.getElementById('user-discovery-search').value = '';
+            errorMessage.hidden = true;
             if (window.location.protocol === 'file:') {
                 errorMessage.textContent = 'Open the chat app from its server at http://127.0.0.1:8000/; opening index.html directly blocks API requests.';
+                errorMessage.hidden = false;
             }
             dialog.showModal();
-            document.getElementById('add-contact-username').focus();
+            loadDiscoverableUsers();
+            document.getElementById('user-discovery-search').focus();
         }
  
         function closeAddContactDialog() {
@@ -1103,6 +1197,7 @@
             renderOwnProfile();
             updateChatHeader();
             renderContactsList();
+            updateOnboardingGuide();
         }
 
         function renderContactsList() {
@@ -1188,6 +1283,7 @@
  
         function selectContact(contact) {
             activeContact = contact;
+            updateOnboardingGuide();
             updateChatHeader();
             loadContacts();
             loadHistory(); // Load stored history (ADDED FOR ISSUE #23)
