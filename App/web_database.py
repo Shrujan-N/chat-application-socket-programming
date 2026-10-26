@@ -88,6 +88,23 @@ def init_db():
           created_at TEXT NOT NULL,
           PRIMARY KEY (username, muted_user)
         );
+        CREATE TABLE IF NOT EXISTS user_blocks (
+          blocker_username TEXT NOT NULL,
+          blocked_username TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (blocker_username, blocked_username),
+          CHECK (blocker_username <> blocked_username)
+        );
+        CREATE TABLE IF NOT EXISTS user_reports (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          reporter_username TEXT NOT NULL,
+          reported_username TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'open',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_reports_status_created
+          ON user_reports(status, created_at);
         CREATE TABLE IF NOT EXISTS push_log (
           msg_id TEXT NOT NULL,
           endpoint TEXT NOT NULL,

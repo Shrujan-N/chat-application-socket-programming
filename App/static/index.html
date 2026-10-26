@@ -559,7 +559,7 @@
             document.getElementById('messages-list').innerHTML = '';
             lastActivity = Date.now();
             initWebSocket();
-            loadMuted().finally(loadContacts);   // mute list first so the bell icons are right
+            Promise.all([loadMuted(), loadBlocked()]).finally(loadContacts);   // load safety settings before rendering the contact actions
             clearInterval(idleTimer);
             idleTimer = setInterval(checkIdle, 10000);
             initPush();            // FR-19: service worker + subscription
@@ -580,6 +580,7 @@
             profileCache = {};
             lastContacts = [];
             mutedUsers = new Set();
+            blockedUsers = new Set();
             pushActive = false;
             pushServerReady = false;
             updatePushUI();
@@ -683,6 +684,7 @@
         let pushActive = false;          // this device is subscribed for the logged-in user
         let pushBusy = false;
         let mutedUsers = new Set();
+        let blockedUsers = new Set();
         let pendingChat = null;          // chat to open after a notification click while the app was closed
 
         function pageInFront() {
@@ -846,6 +848,56 @@
             }
             if (!document.getElementById('global-search').value.trim()) renderContactsList();
             updateChatHeader();
+        }
+
+        async function loadBlocked() {
+            try {
+                const response = await window.fetch('/api/blocks');
+                const data = await readJsonResult(response);
+                blockedUsers = new Set(data.blocked || []);
+            } catch (error) {
+                console.warn('Could not load blocked users:', error);
+                blockedUsers = new Set();
+            }
+        }
+
+        async function toggleBlock(username) {
+            const wasBlocked = blockedUsers.has(username);
+            const action = wasBlocked ? 'unblock' : 'block';
+            if (!confirm(`Are you sure you want to ${action} @${username}? ${wasBlocked ? 'They may be able to message you again.' : 'Neither of you will be able to send messages while the block is active.'}`)) return;
+
+            try {
+                let data;
+                if (wasBlocked) {
+                    const response = await window.fetch(`/api/blocks/${encodeURIComponent(username)}`, { method: 'DELETE' });
+                    data = await readJsonResult(response);
+                } else {
+                    data = await postJson('/api/blocks', { username: username });
+                }
+                const updated = new Set(blockedUsers);
+                if (wasBlocked) updated.delete(username); else updated.add(username);
+                blockedUsers = new Set(data.blocked || updated);
+                if (!document.getElementById('global-search').value.trim()) renderContactsList();
+                updateChatHeader();
+                alert(data.message || `@${username} ${wasBlocked ? 'unblocked' : 'blocked'}.`);
+            } catch (error) {
+                alert(error.message || `Could not ${action} this user.`);
+            }
+        }
+
+        async function reportUser(username) {
+            const reason = prompt(`Why are you reporting @${username}? Please describe the concern (at least 5 characters).`);
+            if (reason === null) return;
+            if (reason.trim().length < 5) {
+                alert('Please provide a report reason of at least 5 characters.');
+                return;
+            }
+            try {
+                const data = await postJson('/api/reports', { username: username, reason: reason.trim() });
+                alert(data.message || 'Report submitted.');
+            } catch (error) {
+                alert(error.message || 'Could not submit the report.');
+            }
         }
 
         function captureChatLink() {
@@ -1225,8 +1277,10 @@
                             ${profile.bio ? `<span class="contact-bio">${escapeHtml(profile.bio)}</span>` : ''}
                         </span>
                     </span>
-                    <button onclick="toggleMute('${contact}')" style="background:none; border:none; cursor:pointer; font-size:14px;" title="${mutedUsers.has(contact) ? 'Unmute notifications' : 'Mute notifications'}">${mutedUsers.has(contact) ? '🔕' : '🔔'}</button>
-                    <button onclick="removeContact('${contact}')" style="background:none; border:none; color:#ff4d4d; cursor:pointer; font-size:14px;" title="Remove Contact">❌</button>
+                    <button onclick="toggleMute('${contact}')" style="background:none; border:none; cursor:pointer; font-size:14px;" title="${mutedUsers.has(contact) ? 'Unmute notifications' : 'Mute notifications'}" aria-label="${mutedUsers.has(contact) ? 'Unmute' : 'Mute'} ${escapeHtml(contact)}">${mutedUsers.has(contact) ? '🔕' : '🔔'}</button>
+                    <button onclick="toggleBlock('${contact}')" style="background:none; border:none; cursor:pointer; font-size:14px;" title="${blockedUsers.has(contact) ? 'Unblock user' : 'Block user'}" aria-label="${blockedUsers.has(contact) ? 'Unblock' : 'Block'} ${escapeHtml(contact)}">${blockedUsers.has(contact) ? '✅' : '🚫'}</button>
+                    <button onclick="reportUser('${contact}')" style="background:none; border:none; cursor:pointer; font-size:14px;" title="Report user" aria-label="Report ${escapeHtml(contact)}">⚑</button>
+                    <button onclick="removeContact('${contact}')" style="background:none; border:none; color:#ff4d4d; cursor:pointer; font-size:14px;" title="Remove Contact" aria-label="Remove ${escapeHtml(contact)}">❌</button>
                 `;
                 listElement.appendChild(item);
             });
@@ -1343,6 +1397,13 @@
                         alert(`New message from ${data.sender}!`);
                     }
                 }
+            }
+            else if (data.type === "error") {
+                if (data.msg_id) {
+                    removeFromOutbox(data.msg_id);
+                    setMessageStatus(data.msg_id, '×', data.message || 'Message was not sent');
+                }
+                alert(data.message || 'The server could not process that action.');
             }
             // Update Checkmark Visual State (ADDED FOR ISSUE #22)
             else if (data.type === "status_update") {
@@ -1466,6 +1527,10 @@
 
             if (!content || !activeContact) {
                 if (!activeContact) alert('Please select a contact first!');
+                return;
+            }
+            if (blockedUsers.has(activeContact)) {
+                alert(`You have blocked @${activeContact}. Unblock them before sending a message.`);
                 return;
             }
 
