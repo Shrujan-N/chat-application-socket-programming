@@ -20,6 +20,19 @@
         .message-status { font-size: 11px; margin-left: 6px; float: right; color: #8696a0; }
         .message-status.read { color: #53bdeb; }
         #input-area { padding: 15px; background: #1a2332; border-top: 1px solid #2e3b52; display: flex; gap: 10px; align-items: center; }
+        #voice-record-button { flex: none; padding: 10px 12px; background: #596579; }
+        #voice-record-button:hover { background: #465166; }
+        #voice-record-button.recording { background: #dc3545; }
+        #voice-record-button.recording:hover { background: #b52a37; }
+        #voice-record-status { color: #aebed2; font-size: 11px; line-height: 1.3; max-width: 180px; }
+        .voice-message { display: flex; flex-direction: column; gap: 5px; min-width: 220px; }
+        .voice-message audio { width: min(300px, 70vw); max-width: 100%; height: 40px; }
+        .voice-message-label { font-size: 11px; color: #b7c4d8; }
+        @media (max-width: 700px) {
+            #input-area { flex-wrap: wrap; padding: 10px; gap: 6px; }
+            #voice-record-status { flex-basis: 100%; max-width: 100%; }
+            #input-area #message-input { min-width: 100px; }
+        }
         input[type="text"] { flex: 1; padding: 10px; border-radius: 6px; border: 1px solid #2e3b52; background: #0f141d; color: #fff; outline: none; }
         button { padding: 10px 18px; border: none; background: #007bff; color: white; border-radius: 6px; cursor: pointer; font-weight: bold; }
         button:hover { background: #0056b3; }
@@ -203,8 +216,10 @@
         <div id="messages-list"></div>
         <div id="input-area">
             <input type="file" id="file-input" style="display:none;" onchange="uploadFile()">
-            <button onclick="document.getElementById('file-input').click()" type="button" title="Attach a file">&#128206;</button>
+            <button type="button" onclick="document.getElementById('file-input').click()" title="Attach a file" aria-label="Attach a file">&#128206;</button>
             <button id="gif-picker-open" type="button" onclick="openGifPicker('gif')" title="Send a GIF or sticker" aria-label="Send a GIF or sticker">GIFs</button>
+            <button type="button" id="voice-record-button" onclick="toggleVoiceRecording()" title="Record a voice message" aria-label="Record a voice message">&#127908;</button>
+            <span id="voice-record-status" role="status" aria-live="polite" hidden></span>
             <input type="text" id="message-input" placeholder="Type a message..." onkeydown="if(event.key==='Enter') sendMessage()">
             <button onclick="sendMessage()">Send</button>
         </div>
@@ -1825,6 +1840,214 @@
                 }
             } else {
                 setMessageStatus(msgId, '…', 'Queued; waiting for connection');
+                initWebSocket();
+            }
+        }
+
+        // --- Voice Messages (Issue #38) ---
+        const MAX_VOICE_MESSAGE_MS = 60 * 1000;
+        const MAX_VOICE_MESSAGE_BYTES = 5 * 1024 * 1024;
+        const VOICE_MIME_PREFERENCES = [
+            'audio/webm;codecs=opus',
+            'audio/ogg;codecs=opus',
+            'audio/mp4;codecs=mp4a.40.2',
+            'audio/webm',
+            'audio/ogg',
+            'audio/mp4'
+        ];
+        const VOICE_EXTENSIONS = {
+            'audio/webm': 'webm',
+            'audio/ogg': 'ogg',
+            'audio/mp4': 'm4a',
+            'audio/mpeg': 'mp3',
+            'audio/wav': 'wav',
+            'audio/x-wav': 'wav'
+        };
+        let activeVoiceRecorder = null;
+        let activeVoiceStream = null;
+        let voiceRecordingChunks = [];
+        let voiceRecordingRecipient = null;
+        let voiceRecordingStartedAt = 0;
+        let voiceRecordingTimer = null;
+        let voiceUploadBusy = false;
+
+        function setVoiceRecordStatus(message, visible = true) {
+            const status = document.getElementById('voice-record-status');
+            if (!status) return;
+            status.textContent = message || '';
+            status.hidden = !visible || !message;
+        }
+
+        function resetVoiceRecordButton() {
+            const button = document.getElementById('voice-record-button');
+            if (!button) return;
+            button.textContent = '🎙️';
+            button.title = 'Record a voice message';
+            button.setAttribute('aria-label', 'Record a voice message');
+            button.classList.remove('recording');
+            button.disabled = false;
+        }
+
+        function stopVoiceStream() {
+            if (activeVoiceStream) {
+                activeVoiceStream.getTracks().forEach(track => track.stop());
+                activeVoiceStream = null;
+            }
+        }
+
+        async function toggleVoiceRecording() {
+            if (voiceUploadBusy) return;
+            if (activeVoiceRecorder && activeVoiceRecorder.state === 'recording') {
+                setVoiceRecordStatus('Preparing your voice message…');
+                activeVoiceRecorder.stop();
+                return;
+            }
+            if (!activeContact) {
+                alert('Please select a contact before recording a voice message.');
+                return;
+            }
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === 'undefined') {
+                setVoiceRecordStatus('Voice recording is not supported in this browser. Try the latest Chrome or Edge.');
+                return;
+            }
+
+            let stream = null;
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const preferredType = VOICE_MIME_PREFERENCES.find(type =>
+                    typeof MediaRecorder.isTypeSupported !== 'function' || MediaRecorder.isTypeSupported(type)
+                );
+                const recorder = preferredType ? new MediaRecorder(stream, { mimeType: preferredType }) : new MediaRecorder(stream);
+                activeVoiceStream = stream;
+                activeVoiceRecorder = recorder;
+                voiceRecordingChunks = [];
+                voiceRecordingRecipient = activeContact;
+                voiceRecordingStartedAt = Date.now();
+
+                recorder.addEventListener('dataavailable', event => {
+                    if (event.data && event.data.size > 0) voiceRecordingChunks.push(event.data);
+                });
+                recorder.addEventListener('error', () => {
+                    setVoiceRecordStatus('The recording encountered an error. Try recording again.');
+                });
+                recorder.addEventListener('stop', async () => {
+                    const chunks = voiceRecordingChunks;
+                    const recipient = voiceRecordingRecipient;
+                    const elapsed = Date.now() - voiceRecordingStartedAt;
+                    const recordedType = (recorder.mimeType || (chunks[0] && chunks[0].type) || 'audio/webm').split(';', 1)[0].toLowerCase();
+                    voiceRecordingChunks = [];
+                    voiceRecordingRecipient = null;
+                    if (voiceRecordingTimer) clearTimeout(voiceRecordingTimer);
+                    voiceRecordingTimer = null;
+                    stopVoiceStream();
+                    activeVoiceRecorder = null;
+                    resetVoiceRecordButton();
+
+                    if (!chunks.length || elapsed < 300) {
+                        setVoiceRecordStatus('No audio was recorded. Press the microphone to try again.');
+                        return;
+                    }
+                    if (elapsed > MAX_VOICE_MESSAGE_MS + 1500) {
+                        setVoiceRecordStatus('Voice messages can be at most 60 seconds long. Please record again.');
+                        return;
+                    }
+                    const extension = VOICE_EXTENSIONS[recordedType];
+                    if (!extension) {
+                        setVoiceRecordStatus('This browser produced an unsupported audio format. Try Chrome or Edge.');
+                        return;
+                    }
+                    const blob = new Blob(chunks, { type: recordedType });
+                    if (blob.size > MAX_VOICE_MESSAGE_BYTES) {
+                        setVoiceRecordStatus('The voice message is over 5 MB. Please record a shorter clip.');
+                        return;
+                    }
+                    if (!recipient) {
+                        setVoiceRecordStatus('No recipient was selected for this recording. Please try again.');
+                        return;
+                    }
+
+                    voiceUploadBusy = true;
+                    document.getElementById('voice-record-button').disabled = true;
+                    setVoiceRecordStatus('Uploading voice message…');
+                    try {
+                        await uploadAndSendVoiceMessage(blob, recordedType, extension, recipient);
+                        setVoiceRecordStatus('Voice message sent.');
+                    } catch (error) {
+                        console.error('Voice message upload failed:', error);
+                        setVoiceRecordStatus(`Could not send voice message: ${error.message || 'Please try again.'}`);
+                    } finally {
+                        voiceUploadBusy = false;
+                        resetVoiceRecordButton();
+                    }
+                });
+
+                recorder.start(250);
+                const button = document.getElementById('voice-record-button');
+                button.textContent = '⏹ Stop';
+                button.title = 'Stop recording and send';
+                button.setAttribute('aria-label', 'Stop recording and send voice message');
+                button.classList.add('recording');
+                setVoiceRecordStatus('Recording… maximum 60 seconds. Click Stop to send.');
+                voiceRecordingTimer = setTimeout(() => {
+                    if (activeVoiceRecorder === recorder && recorder.state === 'recording') {
+                        setVoiceRecordStatus('60-second limit reached. Finishing recording…');
+                        recorder.stop();
+                    }
+                }, MAX_VOICE_MESSAGE_MS);
+            } catch (error) {
+                if (stream) stream.getTracks().forEach(track => track.stop());
+                stopVoiceStream();
+                activeVoiceRecorder = null;
+                if (error && (error.name === 'NotAllowedError' || error.name === 'SecurityError')) {
+                    setVoiceRecordStatus('Microphone access was blocked. Allow microphone access in your browser settings.');
+                } else {
+                    setVoiceRecordStatus(`Could not start recording: ${error.message || 'Check your microphone and try again.'}`);
+                }
+                resetVoiceRecordButton();
+            }
+        }
+
+        async function uploadAndSendVoiceMessage(blob, mimeType, extension, recipient) {
+            const form = new FormData();
+            form.append('file', blob, `voice-message.${extension}`);
+            const response = await window.fetch('/api/voice-messages/upload', { method: 'POST', body: form });
+            const result = await readJsonResult(response);
+            if (!result.success || typeof result.file_url !== 'string'
+                || !/^\/uploads\/voice-[a-f0-9]{32}\.(webm|ogg|m4a|mp3|wav)$/.test(result.file_url)) {
+                throw new Error(result.message || 'The server returned an invalid voice-message URL.');
+            }
+
+            const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const audioMarkup = `<div class="voice-message"><audio controls preload="metadata" src="${result.file_url}" aria-label="Voice message from ${currentUser}"></audio><span class="voice-message-label">🎙️ Voice message</span></div>`;
+            const msgId = 'msg-' + (window.crypto && crypto.randomUUID
+                ? crypto.randomUUID()
+                : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+            const payload = {
+                type: 'send_message',
+                msg_id: msgId,
+                sender: currentUser,
+                recipient,
+                content: audioMarkup,
+                timestamp: timeStr
+            };
+
+            queueOutgoingMessage(payload);
+            if (activeContact === recipient) {
+                appendMessageUI(currentUser, audioMarkup, timeStr, 'sending', msgId);
+                setMessageStatus(msgId, '…', 'Waiting for server status');
+            }
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                if (transmitQueuedMessage(payload)) {
+                    const outbox = readOutbox();
+                    const queued = outbox.find(item => item.msg_id === msgId);
+                    if (queued) {
+                        queued.attempts = (queued.attempts || 0) + 1;
+                        queued.lastAttemptAt = Date.now();
+                        saveOutbox(outbox);
+                    }
+                }
+            } else {
+                if (activeContact === recipient) setMessageStatus(msgId, '…', 'Queued; waiting for connection');
                 initWebSocket();
             }
         }
