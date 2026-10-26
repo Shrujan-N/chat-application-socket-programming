@@ -89,6 +89,7 @@ PUBLIC_API_PATHS = {
 }
  
 app = FastAPI(title="Chat Application - Socket Programming")
+GIPHY_API_KEY = os.environ.get("GIPHY_API_KEY", "").strip()
 import asyncio
 import shutil
 import uuid
@@ -791,6 +792,18 @@ def current_username(request: Request) -> str:
 
 def client_ip(request: Request):
     return request.client.host if request.client else None
+
+
+@app.get("/api/gifs/config")
+async def get_gif_config(request: Request):
+    """Return client configuration after confirming the current session."""
+    current_username(request)
+    return {
+        "provider": "giphy",
+        "enabled": bool(GIPHY_API_KEY),
+        # GIPHY's Search API is intended to be called by the client.
+        "api_key": GIPHY_API_KEY or None,
+    }
 
 
 async def broadcast_profile(username: str, profile: dict):

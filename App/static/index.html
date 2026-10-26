@@ -65,6 +65,30 @@
         #push-toggle { padding: 4px 10px; font-size: 11px; background: #6c757d; }
         #push-toggle:hover { background: #565e64; }
 
+        /* --- Stickers and GIF picker (Issue #40) --- */
+        #gif-picker-dialog { width: min(720px, calc(100% - 24px)); max-height: 86vh; margin: auto; padding: 18px; border: 1px solid #2e3b52; border-radius: 12px; background: #1a2332; color: #fff; }
+        #gif-picker-dialog::backdrop { background: rgba(0, 0, 0, 0.72); }
+        .gif-picker-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+        .gif-picker-header h2 { font-size: 18px; }
+        #gif-picker-close { padding: 5px 10px; background: #374151; }
+        .gif-picker-tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+        .gif-picker-tabs button { flex: 1; background: #29364a; }
+        .gif-picker-tabs button.active { background: #007bff; }
+        #gif-search-input { width: 100%; padding: 10px 12px; border: 1px solid #2e3b52; border-radius: 7px; background: #0f141d; color: #fff; outline: none; margin-bottom: 10px; }
+        #gif-picker-status { color: #b7c4d8; font-size: 12px; min-height: 18px; margin: 4px 0 10px; }
+        #gif-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(125px, 1fr)); gap: 8px; overflow-y: auto; max-height: 48vh; padding: 2px; }
+        .gif-result { display: block; padding: 4px; background: #0f141d; border: 1px solid #2e3b52; border-radius: 7px; min-width: 0; }
+        .gif-result:hover { border-color: #53bdeb; background: #202c33; }
+        .gif-result img { width: 100%; height: 105px; object-fit: contain; border-radius: 4px; }
+        .gif-picker-attribution { color: #b7c4d8; font-size: 11px; margin-top: 12px; text-align: right; }
+        .shared-gif-message img { max-width: 240px; max-height: 240px; width: auto; height: auto; display: block; border-radius: 8px; }
+        .shared-gif-attribution { font-size: 10px; color: #b7c4d8; margin-top: 4px; text-align: right; }
+        @media (max-width: 520px) {
+            #gif-picker-dialog { padding: 12px; }
+            #gif-results { grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: 52vh; }
+            .gif-result img { height: 95px; }
+        }
+
         @media (max-width: 700px) {
             #sidebar { width: 240px; }
             #current-user-label { max-width: 55px; }
@@ -179,7 +203,8 @@
         <div id="messages-list"></div>
         <div id="input-area">
             <input type="file" id="file-input" style="display:none;" onchange="uploadFile()">
-            <button onclick="document.getElementById('file-input').click()">&#128206;</button>
+            <button onclick="document.getElementById('file-input').click()" type="button" title="Attach a file">&#128206;</button>
+            <button id="gif-picker-open" type="button" onclick="openGifPicker('gif')" title="Send a GIF or sticker" aria-label="Send a GIF or sticker">GIFs</button>
             <input type="text" id="message-input" placeholder="Type a message..." onkeydown="if(event.key==='Enter') sendMessage()">
             <button onclick="sendMessage()">Send</button>
         </div>
@@ -233,6 +258,23 @@
     </dialog>
 
 
+
+    <!-- Stickers and GIF search (Issue #40) -->
+    <dialog id="gif-picker-dialog" aria-labelledby="gif-picker-title">
+        <div class="gif-picker-header">
+            <h2 id="gif-picker-title">Send a GIF or sticker</h2>
+            <button id="gif-picker-close" type="button" onclick="closeGifPicker()" aria-label="Close GIF picker">Close</button>
+        </div>
+        <div class="gif-picker-tabs" role="tablist" aria-label="GIF content type">
+            <button type="button" id="gif-tab-gif" class="active" role="tab" aria-selected="true" onclick="setGifKind('gif')">GIFs</button>
+            <button type="button" id="gif-tab-sticker" role="tab" aria-selected="false" onclick="setGifKind('sticker')">Stickers</button>
+        </div>
+        <label for="gif-search-input" class="hint">Search reactions, moods, or topics</label>
+        <input id="gif-search-input" type="search" maxlength="50" autocomplete="off" placeholder="Search GIFs and stickers…" oninput="scheduleGifSearch()">
+        <p id="gif-picker-status" role="status" aria-live="polite">Loading GIF search…</p>
+        <div id="gif-results" aria-label="Search results"></div>
+        <p class="gif-picker-attribution">Powered by GIPHY</p>
+    </dialog>
 
     <!-- High Z-Index Isolated Lightbox Modal (FIXED FOR ISSUE #29) -->
     <div id="image-modal" onclick="closeModal(event)" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.92); z-index:999999; justify-content:center; align-items:center; cursor:pointer;">
@@ -1598,6 +1640,195 @@
             list.scrollTop = list.scrollHeight;
         }
  
+        // --- Stickers and GIFs (Issue #40) ---
+        let giphyApiKey = '';
+        let activeGifKind = 'gif';
+        let gifSearchTimer = null;
+        let gifSearchVersion = 0;
+
+        async function openGifPicker(kind = 'gif') {
+            if (!activeContact) {
+                alert('Please select a contact before sending a GIF or sticker.');
+                return;
+            }
+            if (blockedUsers.has(activeContact)) {
+                alert(`You have blocked @${activeContact}. Unblock them before sending a GIF or sticker.`);
+                return;
+            }
+
+            setGifKind(kind, false);
+            const dialog = document.getElementById('gif-picker-dialog');
+            if (!dialog.open) dialog.showModal();
+            const status = document.getElementById('gif-picker-status');
+            status.textContent = 'Connecting to GIPHY…';
+
+            try {
+                const response = await fetch('/api/gifs/config');
+                const config = await response.json();
+                if (!response.ok) throw new Error(config.detail || 'Could not load GIF search settings.');
+                giphyApiKey = config.enabled ? (config.api_key || '') : '';
+                if (!giphyApiKey) {
+                    status.textContent = 'GIF search is not configured. Set GIPHY_API_KEY in your environment and restart the app.';
+                    document.getElementById('gif-results').replaceChildren();
+                    return;
+                }
+                searchGifs();
+            } catch (error) {
+                status.textContent = error.message || 'Could not connect to GIF search.';
+            }
+        }
+
+        function closeGifPicker() {
+            const dialog = document.getElementById('gif-picker-dialog');
+            if (dialog.open) dialog.close();
+        }
+
+        function setGifKind(kind, shouldSearch = true) {
+            activeGifKind = kind === 'sticker' ? 'sticker' : 'gif';
+            const gifTab = document.getElementById('gif-tab-gif');
+            const stickerTab = document.getElementById('gif-tab-sticker');
+            gifTab.classList.toggle('active', activeGifKind === 'gif');
+            stickerTab.classList.toggle('active', activeGifKind === 'sticker');
+            gifTab.setAttribute('aria-selected', String(activeGifKind === 'gif'));
+            stickerTab.setAttribute('aria-selected', String(activeGifKind === 'sticker'));
+            document.getElementById('gif-search-input').placeholder = activeGifKind === 'gif'
+                ? 'Search GIFs…' : 'Search stickers…';
+            if (shouldSearch && giphyApiKey) searchGifs();
+        }
+
+        function scheduleGifSearch() {
+            clearTimeout(gifSearchTimer);
+            gifSearchTimer = setTimeout(searchGifs, 300);
+        }
+
+        function normalizeGiphyAssetUrl(value) {
+            try {
+                const url = new URL(value);
+                if (url.protocol !== 'https:' || !/(^|\.)giphy\.com$/i.test(url.hostname)) return '';
+                return url.href;
+            } catch (error) {
+                return '';
+            }
+        }
+
+        function escapeGifHtml(value) {
+            return String(value || '').replace(/[&<>"']/g, char => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            })[char]);
+        }
+
+        async function searchGifs() {
+            if (!giphyApiKey) return;
+            const requestVersion = ++gifSearchVersion;
+            const results = document.getElementById('gif-results');
+            const status = document.getElementById('gif-picker-status');
+            const query = document.getElementById('gif-search-input').value.trim() || 'trending';
+            const endpointType = activeGifKind === 'sticker' ? 'stickers' : 'gifs';
+            results.replaceChildren();
+            status.textContent = 'Searching…';
+
+            const params = new URLSearchParams({
+                api_key: giphyApiKey,
+                q: query,
+                limit: '24',
+                rating: 'pg',
+                lang: 'en'
+            });
+
+            try {
+                const response = await window.fetch(`https://api.giphy.com/v1/${endpointType}/search?${params.toString()}`);
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.message || 'GIPHY search failed. Check the API key and try again.');
+                if (requestVersion !== gifSearchVersion) return;
+
+                const items = Array.isArray(data.data) ? data.data : [];
+                let rendered = 0;
+                items.forEach(item => {
+                    const images = item.images || {};
+                    const preview = normalizeGiphyAssetUrl(
+                        images.fixed_height_small?.url || images.preview_gif?.url ||
+                        images.downsized?.url || images.original?.url
+                    );
+                    const full = normalizeGiphyAssetUrl(
+                        images.original?.url || images.fixed_height?.url || images.downsized?.url
+                    );
+                    if (!preview || !full) return;
+
+                    const title = String(item.title || (activeGifKind === 'sticker' ? 'Sticker' : 'GIF')).slice(0, 200);
+                    const choice = document.createElement('button');
+                    choice.type = 'button';
+                    choice.className = 'gif-result';
+                    choice.title = `Send ${title}`;
+                    const image = document.createElement('img');
+                    image.src = preview;
+                    image.alt = title;
+                    image.loading = 'lazy';
+                    image.referrerPolicy = 'no-referrer';
+                    image.addEventListener('error', () => choice.remove(), { once: true });
+                    choice.appendChild(image);
+                    choice.addEventListener('click', () => {
+                        sendGiphyMessage(full, title);
+                        closeGifPicker();
+                    });
+                    results.appendChild(choice);
+                    rendered += 1;
+                });
+                status.textContent = rendered ? `${rendered} results. Select one to send.` : 'No results found. Try another search.';
+            } catch (error) {
+                if (requestVersion !== gifSearchVersion) return;
+                status.textContent = error.message || 'GIF search failed. Please try again.';
+            }
+        }
+
+        function sendGiphyMessage(mediaUrl, title) {
+            if (!activeContact) {
+                alert('Please select a contact before sending a GIF or sticker.');
+                return;
+            }
+            if (blockedUsers.has(activeContact)) {
+                alert(`You have blocked @${activeContact}. Unblock them before sending a GIF or sticker.`);
+                return;
+            }
+            const safeUrl = normalizeGiphyAssetUrl(mediaUrl);
+            if (!safeUrl) {
+                alert('This GIF or sticker has an invalid media URL. Please choose another one.');
+                return;
+            }
+            const safeAttributeUrl = safeUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+            const safeTitle = escapeGifHtml(title);
+            const content = `<div class="shared-gif-message"><img src="${safeAttributeUrl}" alt="${safeTitle}" loading="lazy" referrerpolicy="no-referrer"><div class="shared-gif-attribution">Powered by <a href="https://giphy.com/" target="_blank" rel="noopener noreferrer" style="color:#b7c4d8;">GIPHY</a></div></div>`;
+            const msgId = 'gif-' + (window.crypto && crypto.randomUUID
+                ? crypto.randomUUID()
+                : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+            const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const payload = {
+                type: 'send_message',
+                msg_id: msgId,
+                sender: currentUser,
+                recipient: activeContact,
+                content,
+                timestamp
+            };
+            queueOutgoingMessage(payload);
+            appendMessageUI(currentUser, content, timestamp, 'sending', msgId);
+            setMessageStatus(msgId, '…', 'Waiting for server status');
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                if (transmitQueuedMessage(payload)) {
+                    const outbox = readOutbox();
+                    const queued = outbox.find(item => item.msg_id === msgId);
+                    if (queued) {
+                        queued.attempts = (queued.attempts || 0) + 1;
+                        queued.lastAttemptAt = Date.now();
+                        saveOutbox(outbox);
+                    }
+                }
+            } else {
+                setMessageStatus(msgId, '…', 'Queued; waiting for connection');
+                initWebSocket();
+            }
+        }
+
         // --- Global Scope Lightbox Modal Functions (FIXED FOR ISSUE #29) ---
         window.openModal = function(src) {
             if (!src) return;
