@@ -222,6 +222,101 @@
         let currentUser = null;
         let activeContact = null;
         let ws = null;
+        let reconnectTimer = null;
+        let reconnectDelay = 1000;
+        const OUTBOX_PREFIX = 'chat_outbox:';
+
+        function outboxKey() {
+            return OUTBOX_PREFIX + (currentUser || 'anonymous');
+        }
+
+        function readOutbox() {
+            try {
+                const messages = JSON.parse(localStorage.getItem(outboxKey()) || '[]');
+                return Array.isArray(messages) ? messages : [];
+            } catch (error) {
+                console.error('Could not read pending message queue:', error);
+                return [];
+            }
+        }
+
+        function saveOutbox(messages) {
+            try {
+                localStorage.setItem(outboxKey(), JSON.stringify(messages));
+                return true;
+            } catch (error) {
+                console.error('Could not save pending message queue:', error);
+                return false;
+            }
+        }
+
+        function queueOutgoingMessage(message) {
+            const outbox = readOutbox();
+            if (!outbox.some(item => item.msg_id === message.msg_id)) {
+                outbox.push({ ...message, attempts: 0, queuedAt: Date.now() });
+                if (!saveOutbox(outbox)) {
+                    alert('Browser storage is unavailable. This message may not survive a page refresh.');
+                }
+            }
+        }
+
+        function removeFromOutbox(msgId) {
+            saveOutbox(readOutbox().filter(item => item.msg_id !== msgId));
+        }
+
+        function setMessageStatus(msgId, label, title) {
+            const element = document.getElementById(`status-${msgId}`);
+            if (element) {
+                element.textContent = label;
+                element.title = title || label;
+                element.className = 'message-status';
+            }
+        }
+
+        function transmitQueuedMessage(message, isRetry = false) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                setMessageStatus(message.msg_id, '…', 'Queued until the connection is available');
+                return false;
+            }
+            try {
+                ws.send(JSON.stringify({
+                    type: 'send_message',
+                    msg_id: message.msg_id,
+                    sender: currentUser,
+                    recipient: message.recipient,
+                    content: message.content,
+                    timestamp: message.timestamp
+                }));
+                setMessageStatus(message.msg_id, '…', isRetry ? 'Retrying; waiting for server status' : 'Waiting for server status');
+                return true;
+            } catch (error) {
+                setMessageStatus(message.msg_id, '!', 'Could not send; will retry after reconnecting');
+                console.error('Message transmission failed:', error);
+                return false;
+            }
+        }
+
+        async function flushOutbox() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            const outbox = readOutbox();
+            for (const message of outbox) {
+                if (transmitQueuedMessage(message, (message.attempts || 0) > 0)) {
+                    message.attempts = (message.attempts || 0) + 1;
+                    message.lastAttemptAt = Date.now();
+                }
+            }
+            saveOutbox(outbox);
+        }
+
+        function scheduleReconnect() {
+            if (reconnectTimer || !authToken || !currentUser) return;
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                initWebSocket();
+            }, reconnectDelay);
+            reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+        }
  
         // ================= Authentication & session handling =================
         const TOKEN_KEY = 'chat_token';
@@ -447,6 +542,10 @@
  
         function endSession(message) {
             clearInterval(idleTimer);
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
             if (ws) { ws.onmessage = null; ws.onclose = null; ws.close(); ws = null; }
             authToken = null;
             currentUser = null;
@@ -516,18 +615,37 @@
  
         // ================= Chat application =================
         function initWebSocket() {
+            if (!authToken || !currentUser) return;
+            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
             const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
-            ws = new WebSocket(`${scheme}://${window.location.host}/ws/${currentUser}?token=${encodeURIComponent(authToken)}`);
-            ws.onopen = reportVisibility;
+            try {
+                ws = new WebSocket(`${scheme}://${window.location.host}/ws/${currentUser}?token=${encodeURIComponent(authToken)}`);
+            } catch (error) {
+                console.error('Could not create WebSocket connection:', error);
+                scheduleReconnect();
+                return;
+            }
+            ws.onopen = function() {
+                reconnectDelay = 1000;
+                reportVisibility();
+                flushOutbox();
+            };
             ws.onmessage = function(event) {
-                const data = JSON.parse(event.data);
-                handleIncomingSignal(data);
+                try {
+                    handleIncomingSignal(JSON.parse(event.data));
+                } catch (error) {
+                    console.error('Ignoring invalid server message:', error);
+                }
+            };
+            ws.onerror = function(error) {
+                console.warn('WebSocket connection error:', error);
             };
             ws.onclose = function(event) {
-                // 4401 = missing/expired/invalid session, 4403 = token belongs to another user
                 if (authToken && (event.code === 4401 || event.code === 4403)) {
                     endSession('Session expired. Please log in again.');
+                    return;
                 }
+                scheduleReconnect();
             };
         }
  
@@ -1078,16 +1196,36 @@
         // --- Fetch Chat History from SQLite (ADDED FOR ISSUE #23) ---
         async function loadHistory() {
             if (!activeContact) return;
-            const response = await fetch(`/api/messages/history/${currentUser}/${activeContact}`);
-            const data = await response.json();
-            
-            const list = document.getElementById('messages-list');
-            list.innerHTML = '';
-            
-            if (data.history) {
-                data.history.forEach(msg => {
+            const contactAtRequest = activeContact;
+
+            try {
+                const response = await fetch(
+                    `/api/messages/history/${encodeURIComponent(currentUser)}/${encodeURIComponent(contactAtRequest)}`
+                );
+                if (!response.ok) {
+                    throw new Error(`History request failed (HTTP ${response.status})`);
+                }
+                const data = await response.json();
+                if (activeContact !== contactAtRequest) return;
+
+                const list = document.getElementById('messages-list');
+                list.innerHTML = '';
+                const knownIds = new Set();
+
+                (data.history || []).forEach(msg => {
+                    if (msg.msg_id) knownIds.add(msg.msg_id);
                     appendMessageUI(msg.sender, msg.content, msg.timestamp, msg.status, msg.msg_id);
                 });
+
+                // Keep queued messages visible after refresh until the server acknowledges them.
+                readOutbox()
+                    .filter(msg => msg.recipient === contactAtRequest && !knownIds.has(msg.msg_id))
+                    .forEach(msg => {
+                        appendMessageUI(currentUser, msg.content, msg.timestamp, 'sending', msg.msg_id);
+                        setMessageStatus(msg.msg_id, '…', 'Queued; waiting for server confirmation');
+                    });
+            } catch (error) {
+                console.error('Could not load conversation history:', error);
             }
         }
  
@@ -1113,12 +1251,28 @@
             // Update Checkmark Visual State (ADDED FOR ISSUE #22)
             else if (data.type === "status_update") {
                 const statusElem = document.getElementById(`status-${data.msg_id}`);
-                if (statusElem) {
-                    if (data.status === 'delivered') {
+
+                if (data.status === 'sent') {
+                    // The server has durably saved this message; recipient delivery is separate.
+                    removeFromOutbox(data.msg_id);
+                    if (statusElem) {
+                        statusElem.textContent = '✓';
+                        statusElem.title = 'Saved on server';
+                        statusElem.className = 'message-status';
+                    }
+                } else if (data.status === 'delivered') {
+                    removeFromOutbox(data.msg_id);
+                    if (statusElem) {
                         statusElem.innerHTML = '&#10003;&#10003;';
-                    } else if (data.status === 'read') {
+                        statusElem.title = 'Delivered';
+                        statusElem.className = 'message-status';
+                    }
+                } else if (data.status === 'read') {
+                    removeFromOutbox(data.msg_id);
+                    if (statusElem) {
                         statusElem.innerHTML = '&#10003;&#10003;';
                         statusElem.className = 'message-status read';
+                        statusElem.title = 'Read';
                     }
                 }
             }
@@ -1213,35 +1367,70 @@
         function sendMessage() {
             const input = document.getElementById('message-input');
             const content = input.value.trim();
-            
+
             if (!content || !activeContact) {
-                if(!activeContact) alert("Please select a contact first!");
+                if (!activeContact) alert('Please select a contact first!');
                 return;
             }
- 
-            const msgId = 'msg-' + Date.now();
+
+            const msgId = 'msg-' + (window.crypto && crypto.randomUUID
+                ? crypto.randomUUID()
+                : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
             const payload = {
-                type: "send_message",
+                type: 'send_message',
                 msg_id: msgId,
                 sender: currentUser,
                 recipient: activeContact,
                 content: content,
                 timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
             };
- 
-            ws.send(JSON.stringify(payload));
-            appendMessageUI(currentUser, content, payload.timestamp, 'sent', msgId);
+
+            queueOutgoingMessage(payload);
+            appendMessageUI(currentUser, content, payload.timestamp, 'sending', msgId);
+            setMessageStatus(msgId, '…', 'Waiting for server status');
             input.value = '';
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                if (transmitQueuedMessage(payload)) {
+                    const outbox = readOutbox();
+                    const queued = outbox.find(item => item.msg_id === msgId);
+                    if (queued) {
+                        queued.attempts = (queued.attempts || 0) + 1;
+                        queued.lastAttemptAt = Date.now();
+                        saveOutbox(outbox);
+                    }
+                }
+            } else {
+                setMessageStatus(msgId, '…', 'Queued; waiting for connection');
+                initWebSocket();
+            }
         }
- 
+
         function appendMessageUI(sender, content, timeStr, status, msgId) {
             const list = document.getElementById('messages-list');
+            if (msgId && document.getElementById(`msg-${msgId}`)) return;
             const msgDiv = document.createElement('div');
             const isSent = (sender === currentUser);
             msgDiv.className = `message ${isSent ? 'sent' : 'received'}`;
             msgDiv.id = `msg-${msgId}`;
             
-            let statusHTML = isSent ? `<span class="message-status" id="status-${msgId}">&#10003;</span>` : '';
+            let statusHTML = '';
+            if (isSent) {
+                let label = '&#10003;';
+                let title = 'Saved on server';
+                if (status === 'sending' || status === 'queued') {
+                    label = '…';
+                    title = 'Waiting for server confirmation';
+                } else if (status === 'delivered') {
+                    label = '&#10003;&#10003;';
+                    title = 'Delivered';
+                } else if (status === 'read') {
+                    label = '&#10003;&#10003;';
+                    title = 'Read';
+                }
+                const readClass = status === 'read' ? ' read' : '';
+                statusHTML = `<span class="message-status${readClass}" id="status-${msgId}" title="${title}">${label}</span>`;
+            }
             msgDiv.innerHTML = `<div>${content}</div><div style="font-size:10px; opacity:0.7; text-align:right;">${timeStr} ${statusHTML}</div>`;
             
             list.appendChild(msgDiv);

@@ -97,11 +97,8 @@ STATIC = BASE / "static"
 UPLOADS = BASE / "uploads"
 STATIC.mkdir(exist_ok=True)
 UPLOADS.mkdir(exist_ok=True)
-app = FastAPI(title="Chat Application")
 init_core_db()
 init_web_db()
-app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
-app.mount("/uploads", StaticFiles(directory=str(UPLOADS)), name="uploads")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(APP_DIR, "static")
@@ -547,19 +544,46 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-def persist_websocket_message(msg_id: str, sender: str, recipient: str, content: str, timestamp: str):
+def persist_websocket_message(
+    msg_id: str,
+    sender: str,
+    recipient: str,
+    content: str,
+    timestamp: str,
+):
+    """Persist a message once; identical retries are safe and idempotent."""
     conn = None
     try:
         conn = get_db()
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
+        cursor = conn.execute(
             """
-            INSERT INTO messages (msg_id, sender, recipient, content, timestamp, status)
+            INSERT OR IGNORE INTO messages
+                (msg_id, sender, recipient, content, timestamp, status)
             VALUES (?, ?, ?, ?, ?, 'sent')
             """,
             (msg_id, sender, recipient, content, timestamp),
         )
+        inserted = cursor.rowcount == 1
+
+        if not inserted:
+            existing = conn.execute(
+                """
+                SELECT sender, recipient, content
+                FROM messages
+                WHERE msg_id = ?
+                """,
+                (msg_id,),
+            ).fetchone()
+            if existing is None or (
+                existing["sender"] != sender
+                or existing["recipient"] != recipient
+                or existing["content"] != content
+            ):
+                raise ValueError("Message ID conflicts with an existing message")
+
         conn.commit()
+        return inserted
     except Exception:
         if conn is not None:
             try:
@@ -574,7 +598,6 @@ def persist_websocket_message(msg_id: str, sender: str, recipient: str, content:
                 conn.close()
             except sqlite3.Error:
                 logger.exception("Failed to close message database connection")
-
 
 @app.websocket("/ws/{username}")
 async def websocket_endpoint(websocket: WebSocket, username: str):
@@ -639,25 +662,44 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 recipient = recipient.strip()
                 msg_id = msg_id.strip()
                 try:
-                    persist_websocket_message(msg_id, username, recipient, content, timestamp)
-                except sqlite3.IntegrityError:
+                    inserted = persist_websocket_message(
+                        msg_id, username, recipient, content, timestamp
+                    )
+                except ValueError:
                     await websocket.send_json({
-                        "type": "error", "msg_id": msg_id,
-                        "message": "Message could not be saved. Use a unique message ID.",
+                        "type": "error",
+                        "msg_id": msg_id,
+                        "message": "Message ID conflicts with an existing message.",
                     })
                     continue
                 except sqlite3.Error:
                     await websocket.send_json({
-                        "type": "error", "msg_id": msg_id,
+                        "type": "error",
+                        "msg_id": msg_id,
                         "message": "Message could not be saved. Please retry.",
                     })
                     continue
                 except Exception:
-                    logger.exception("Unexpected message-processing failure: username=%s", username)
+                    logger.exception(
+                        "Unexpected message-processing failure: username=%s",
+                        username,
+                    )
                     await websocket.send_json({
-                        "type": "error", "msg_id": msg_id,
+                        "type": "error",
+                        "msg_id": msg_id,
                         "message": "Message processing failed. Please retry.",
                     })
+                    continue
+
+                # A sent acknowledgment confirms durable server persistence, not recipient delivery.
+                await websocket.send_json({
+                    "type": "status_update",
+                    "msg_id": msg_id,
+                    "status": "sent",
+                })
+
+                # A duplicate retry was already persisted and must not be forwarded twice.
+                if not inserted:
                     continue
 
                 incoming_frame = {
