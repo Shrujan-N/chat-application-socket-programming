@@ -70,6 +70,15 @@ class PushUnsubscribeSchema(BaseModel):
 class MuteSchema(BaseModel):
     username: str = ""
     muted: bool = True
+
+
+class BlockUserSchema(BaseModel):
+    username: str = ""
+
+
+class ReportUserSchema(BaseModel):
+    username: str = ""
+    reason: str = ""
  
  
 MAX_FAILED_ATTEMPTS = 5
@@ -662,6 +671,23 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 recipient = recipient.strip()
                 msg_id = msg_id.strip()
                 try:
+                    block_active = users_are_blocked(username, recipient)
+                except sqlite3.Error:
+                    logger.exception("Could not verify block state: sender=%s recipient=%s", username, recipient)
+                    await websocket.send_json({
+                        "type": "error",
+                        "msg_id": msg_id,
+                        "message": "Message was not sent because block settings could not be verified. Please retry.",
+                    })
+                    continue
+                if block_active:
+                    await websocket.send_json({
+                        "type": "error",
+                        "msg_id": msg_id,
+                        "message": "Message not sent: a block is active between you and this user.",
+                    })
+                    continue
+                try:
                     inserted = persist_websocket_message(
                         msg_id, username, recipient, content, timestamp
                     )
@@ -933,6 +959,130 @@ async def set_muted(payload: MuteSchema, request: Request):
     return {"success": True, "muted": muted}
 
 
+def users_are_blocked(first_user: str, second_user: str) -> bool:
+    """Return True if either user has blocked the other."""
+    if not first_user or not second_user:
+        return False
+    conn = get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT 1 FROM user_blocks
+            WHERE (blocker_username = ? AND blocked_username = ?)
+               OR (blocker_username = ? AND blocked_username = ?)
+            LIMIT 1
+            """,
+            (first_user, second_user, second_user, first_user),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def list_blocked_users(username: str) -> list[str]:
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT blocked_username FROM user_blocks WHERE blocker_username = ? ORDER BY blocked_username",
+            (username,),
+        ).fetchall()
+        return [row["blocked_username"] for row in rows]
+    finally:
+        conn.close()
+
+
+@app.get("/api/blocks")
+async def get_blocked_users(request: Request):
+    username = current_username(request)
+    return {"blocked": list_blocked_users(username)}
+
+
+@app.post("/api/blocks")
+async def block_user(payload: BlockUserSchema, request: Request):
+    username = current_username(request)
+    target = payload.username.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", target):
+        raise HTTPException(status_code=400, detail="Enter a valid username.")
+    if target.casefold() == username.casefold():
+        raise HTTPException(status_code=400, detail="You cannot block your own account.")
+
+    conn = get_db()
+    try:
+        exists = conn.execute(
+            "SELECT username FROM users WHERE username = ? COLLATE NOCASE", (target,)
+        ).fetchone()
+        if exists is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        target = exists["username"]
+        conn.execute(
+            "INSERT OR IGNORE INTO user_blocks(blocker_username, blocked_username) VALUES (?, ?)",
+            (username, target),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "success": True,
+        "blocked": list_blocked_users(username),
+        "message": f"@{target} is blocked. Neither of you can send messages to the other while this block is active.",
+    }
+
+
+@app.delete("/api/blocks/{target_username}")
+async def unblock_user(target_username: str, request: Request):
+    username = current_username(request)
+    target = target_username.strip()
+    conn = get_db()
+    try:
+        conn.execute(
+            "DELETE FROM user_blocks WHERE blocker_username = ? AND blocked_username = ?",
+            (username, target),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "success": True,
+        "blocked": list_blocked_users(username),
+        "message": f"@{target} has been unblocked.",
+    }
+
+
+@app.post("/api/reports")
+async def report_user(payload: ReportUserSchema, request: Request):
+    reporter = current_username(request)
+    target = payload.username.strip()
+    reason = payload.reason.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", target):
+        raise HTTPException(status_code=400, detail="Enter a valid username to report.")
+    if target.casefold() == reporter.casefold():
+        raise HTTPException(status_code=400, detail="You cannot report your own account.")
+    if len(reason) < 5:
+        raise HTTPException(status_code=400, detail="Please provide a report reason of at least 5 characters.")
+    if len(reason) > 1000:
+        raise HTTPException(status_code=400, detail="Report reason must be at most 1000 characters.")
+
+    conn = get_db()
+    try:
+        exists = conn.execute(
+            "SELECT username FROM users WHERE username = ? COLLATE NOCASE", (target,)
+        ).fetchone()
+        if exists is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        target = exists["username"]
+        conn.execute(
+            "INSERT INTO user_reports(reporter_username, reported_username, reason) VALUES (?, ?, ?)",
+            (reporter, target, reason),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    logger.info("User report submitted: reporter=%s reported=%s", reporter, target)
+    return {"success": True, "message": "Report submitted. Thank you for helping keep the chat community safe."}
+
+
 # --- Contact Management API Endpoints (ADDED FOR ISSUE #17) ---
 # --- Complete Friend Request & Contact Lifecycle Endpoints (UPDATED FOR ISSUE #17) ---
 class AddContactSchema(BaseModel):
@@ -986,6 +1136,9 @@ async def send_friend_request(payload: AddContactSchema):
     if payload.user_id == payload.contact_username:
         conn.close()
         return {"success": False, "error": "You cannot add yourself as a contact"}
+    if users_are_blocked(payload.user_id, payload.contact_username):
+        conn.close()
+        return {"success": False, "error": "A block is active between these users"}
  
     # Accounts now come from registration, so contacts must be real users
     # (previously unknown names were auto-created with a default password).
@@ -1007,6 +1160,8 @@ async def send_friend_request(payload: AddContactSchema):
 # Accept or Decline Friend Request
 @app.post("/api/contacts/respond")
 async def respond_friend_request(payload: RespondRequestSchema):
+    if payload.action == 'accept' and users_are_blocked(payload.user_id, payload.requester_id):
+        return {"success": False, "error": "Cannot accept this request while a block is active between these users"}
     conn = get_db()
     cursor = conn.cursor()
     
