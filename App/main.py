@@ -519,97 +519,202 @@ async def logout_user(request: Request):
     return {"success": True, "message": "Logged out."}
  
  
-# --- Active WebSocket Registry (ADDED FOR ISSUE #19) ---
+# --- Active WebSocket Registry (Issue #19, #46) ---
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
-        # True while the user's chat page is in front (reported by the page itself, FR-19)
         self.visible: Dict[str, bool] = {}
- 
+
     async def connect(self, username: str, websocket: WebSocket):
         await websocket.accept()
+        previous = self.active_connections.get(username)
         self.active_connections[username] = websocket
         self.visible[username] = True
- 
-    def disconnect(self, username: str):
-        if username in self.active_connections:
-            del self.active_connections[username]
+        if previous is not None and previous is not websocket:
+            try:
+                await previous.close(code=4001, reason="Connection replaced")
+            except Exception:
+                logger.warning("Failed to close replaced WebSocket: username=%s", username, exc_info=True)
+
+    def disconnect(self, username: str, websocket: Optional[WebSocket] = None):
+        current = self.active_connections.get(username)
+        if websocket is not None and current is not websocket:
+            return
+        self.active_connections.pop(username, None)
         self.visible.pop(username, None)
- 
+
+
 manager = ConnectionManager()
- 
+
+
+def persist_websocket_message(msg_id: str, sender: str, recipient: str, content: str, timestamp: str):
+    conn = None
+    try:
+        conn = get_db()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT INTO messages (msg_id, sender, recipient, content, timestamp, status)
+            VALUES (?, ?, ?, ?, ?, 'sent')
+            """,
+            (msg_id, sender, recipient, content, timestamp),
+        )
+        conn.commit()
+    except Exception:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                logger.exception("Failed to roll back message transaction")
+        logger.exception("Failed to persist WebSocket message")
+        raise
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                logger.exception("Failed to close message database connection")
+
+
 @app.websocket("/ws/{username}")
 async def websocket_endpoint(websocket: WebSocket, username: str):
-    # Only an authenticated user may open a socket for their own username
     try:
         claims = validate_session(websocket.query_params.get("token", ""))
     except TokenError:
         logger.warning("Rejected WebSocket connection: invalid session")
         await websocket.close(code=4401)
         return
+
     if claims.get("sub") != username:
         logger.warning("Rejected WebSocket connection: username mismatch")
         await websocket.close(code=4403)
         return
- 
-    await manager.connect(username, websocket)
+
+    try:
+        await manager.connect(username, websocket)
+    except Exception:
+        logger.exception("Failed to establish WebSocket: username=%s", username)
+        try:
+            await websocket.close(code=1011, reason="Connection setup failed")
+        except Exception:
+            logger.debug("WebSocket setup cleanup failed", exc_info=True)
+        return
+
     try:
         while True:
-            data = await websocket.receive_json()
-            if data.get("type") == "send_message":
+            try:
+                data = await websocket.receive_json()
+            except WebSocketDisconnect:
+                raise
+            except Exception:
+                logger.warning("Invalid WebSocket payload: username=%s", username, exc_info=True)
+                try:
+                    await websocket.send_json({"type": "error", "message": "Invalid message format."})
+                except Exception:
+                    logger.debug("Could not report invalid payload: username=%s", username, exc_info=True)
+                    break
+                continue
+
+            if not isinstance(data, dict):
+                await websocket.send_json({"type": "error", "message": "Message must be a JSON object."})
+                continue
+
+            message_type = data.get("type")
+
+            if message_type == "send_message":
                 recipient = data.get("recipient")
                 content = data.get("content")
-                msg_id = data.get("msg_id", str(os.urandom(4).hex()))
+                msg_id = data.get("msg_id") or os.urandom(16).hex()
                 timestamp = data.get("timestamp")
- 
-                # Store message permanently in SQLite Database (ADDED FOR ISSUE #23)
-                conn = get_db()
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO messages (msg_id, sender, recipient, content, timestamp, status)
-                    VALUES (?, ?, ?, ?, ?, 'sent')
-                """, (msg_id, username, recipient, content, timestamp))
-                conn.commit()
-                conn.close()
-                
-                incoming_frame = {
-                    "type": "receive_message",
-                    "msg_id": msg_id,
-                    "sender": username,
-                    "recipient": recipient,
-                    "content": content,
-                    "timestamp": timestamp
-                }
-                
-                if recipient in manager.active_connections:
-                    await manager.active_connections[recipient].send_json(incoming_frame)
-                    # Send 'delivered' status ACK back to sender (ADDED FOR ISSUE #22)
-                    await websocket.send_json({"type": "status_update", "msg_id": msg_id, "status": "delivered"})
 
-                # Push notification (FR-19): the recipient is offline, or their chat
-                # page is in the background, so tell their device about the message.
-                if recipient and (recipient not in manager.active_connections
-                                  or not manager.visible.get(recipient, True)):
-                    schedule_push(msg_id, username, recipient, content)
- 
-            # The page tells the server whether it is in front (FR-19)
-            elif data.get("type") == "visibility":
+                if (
+                    not isinstance(recipient, str) or not recipient.strip()
+                    or not isinstance(content, str) or not content.strip()
+                    or not isinstance(msg_id, str) or not msg_id.strip()
+                    or not isinstance(timestamp, str) or not timestamp.strip()
+                ):
+                    await websocket.send_json({"type": "error", "message": "Invalid message fields."})
+                    continue
+
+                recipient = recipient.strip()
+                msg_id = msg_id.strip()
+                try:
+                    persist_websocket_message(msg_id, username, recipient, content, timestamp)
+                except sqlite3.IntegrityError:
+                    await websocket.send_json({
+                        "type": "error", "msg_id": msg_id,
+                        "message": "Message could not be saved. Use a unique message ID.",
+                    })
+                    continue
+                except sqlite3.Error:
+                    await websocket.send_json({
+                        "type": "error", "msg_id": msg_id,
+                        "message": "Message could not be saved. Please retry.",
+                    })
+                    continue
+                except Exception:
+                    logger.exception("Unexpected message-processing failure: username=%s", username)
+                    await websocket.send_json({
+                        "type": "error", "msg_id": msg_id,
+                        "message": "Message processing failed. Please retry.",
+                    })
+                    continue
+
+                incoming_frame = {
+                    "type": "receive_message", "msg_id": msg_id, "sender": username,
+                    "recipient": recipient, "content": content, "timestamp": timestamp,
+                }
+                recipient_socket = manager.active_connections.get(recipient)
+                if recipient_socket is not None:
+                    try:
+                        await recipient_socket.send_json(incoming_frame)
+                        await websocket.send_json({"type": "status_update", "msg_id": msg_id, "status": "delivered"})
+                    except Exception:
+                        logger.exception("Live message delivery failed: recipient=%s", recipient)
+                        manager.disconnect(recipient, recipient_socket)
+                        try:
+                            await websocket.send_json({"type": "status_update", "msg_id": msg_id, "status": "sent"})
+                        except Exception:
+                            logger.debug("Could not send message status: username=%s", username, exc_info=True)
+
+                if recipient not in manager.active_connections or not manager.visible.get(recipient, True):
+                    try:
+                        schedule_push(msg_id, username, recipient, content)
+                    except Exception:
+                        logger.exception("Failed to schedule push notification: recipient=%s", recipient)
+
+            elif message_type == "visibility":
                 manager.visible[username] = bool(data.get("visible"))
 
-            # Handle Read Receipt ACK frames from recipient (ADDED FOR ISSUE #22)
-            elif data.get("type") == "read_ack":
+            elif message_type == "read_ack":
                 sender = data.get("sender")
                 msg_id = data.get("msg_id")
-                if sender in manager.active_connections:
-                    await manager.active_connections[sender].send_json({
-                        "type": "status_update",
-                        "msg_id": msg_id,
-                        "status": "read"
-                    })
+                if not isinstance(sender, str) or not isinstance(msg_id, str):
+                    await websocket.send_json({"type": "error", "message": "Invalid read receipt."})
+                    continue
+                sender_socket = manager.active_connections.get(sender)
+                if sender_socket is not None:
+                    try:
+                        await sender_socket.send_json({"type": "status_update", "msg_id": msg_id, "status": "read"})
+                    except Exception:
+                        logger.exception("Failed to send read receipt: recipient=%s", sender)
+                        manager.disconnect(sender, sender_socket)
+            else:
+                await websocket.send_json({"type": "error", "message": "Unsupported message type."})
+
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected: username=%s", username)
-        manager.disconnect(username)
- 
+    except Exception:
+        logger.exception("Unexpected WebSocket failure: username=%s", username)
+        try:
+            await websocket.close(code=1011, reason="Unexpected server error")
+        except Exception:
+            logger.debug("Failed to close WebSocket after an error: username=%s", username, exc_info=True)
+    finally:
+        manager.disconnect(username, websocket)
+        logger.info("WebSocket connection cleanup completed: username=%s", username)
+
+
 # --- Profile Management (FR-05) ---
 def current_username(request: Request) -> str:
     """The logged-in user, taken from the session token (never from the URL/body)."""
