@@ -1068,6 +1068,52 @@ async def upload_file(file: UploadFile = File(...)):
         "content_type": file.content_type
     }
  
+# --- Voice message upload endpoint (Issue #38) ---
+VOICE_MESSAGE_UPLOAD_MARKER = "issue38-voice-message-upload"
+MAX_VOICE_MESSAGE_BYTES = 5 * 1024 * 1024
+VOICE_MESSAGE_MIME_TYPES = {
+    "audio/webm": ".webm",
+    "audio/ogg": ".ogg",
+    "audio/mp4": ".m4a",
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+}
+
+
+@app.post("/api/voice-messages/upload")
+async def upload_voice_message(file: UploadFile = File(...)):
+    """Save a short voice recording using a server-generated filename."""
+    content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
+    extension = VOICE_MESSAGE_MIME_TYPES.get(content_type)
+    if extension is None:
+        await file.close()
+        raise HTTPException(status_code=415, detail="Unsupported voice recording format.")
+
+    try:
+        data = await file.read(MAX_VOICE_MESSAGE_BYTES + 1)
+        if not data:
+            raise HTTPException(status_code=400, detail="Voice recording is empty.")
+        if len(data) > MAX_VOICE_MESSAGE_BYTES:
+            raise HTTPException(status_code=413, detail="Voice recording must be 5 MB or smaller.")
+
+        os.makedirs(UPLOADS_DIR, exist_ok=True)
+        filename = f"voice-{uuid.uuid4().hex}{extension}"
+        file_location = os.path.join(UPLOADS_DIR, filename)
+        with open(file_location, "xb") as output:
+            output.write(data)
+
+        return {
+            "success": True,
+            "file_url": f"/uploads/{filename}",
+            "filename": "Voice message",
+            "content_type": content_type,
+            "size": len(data),
+        }
+    finally:
+        await file.close()
+
+
 # --- Full-Text Search API Endpoint (ADDED FOR ISSUE #31) ---
 @app.get("/api/search")
 async def search_query(username: str, q: str):
