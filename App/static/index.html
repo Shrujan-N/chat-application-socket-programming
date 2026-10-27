@@ -78,6 +78,18 @@
         #push-toggle { padding: 4px 10px; font-size: 11px; background: #6c757d; }
         #push-toggle:hover { background: #565e64; }
 
+        /* --- Connection status banner and toast (FR-21) --- */
+        #conn-banner { position: fixed; top: 0; left: 50%; transform: translateX(-50%); z-index: 1500; width: max-content; max-width: min(560px, calc(100% - 16px)); margin-top: calc(8px + env(safe-area-inset-top, 0px)); padding: 8px 12px; border-radius: 8px; font-size: 13px; line-height: 1.35; display: flex; align-items: center; gap: 10px; background: #7a5b00; color: #fff; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45); }
+        #conn-banner[hidden] { display: none; }
+        #conn-banner.offline { background: #6b2430; }
+        #conn-banner.connected { background: #1d6b3a; }
+        #conn-banner.replaced { background: #374151; }
+        #conn-banner button { flex: none; padding: 4px 10px; font-size: 12px; background: rgba(255, 255, 255, 0.2); }
+        #conn-banner button:hover { background: rgba(255, 255, 255, 0.32); }
+        #conn-banner button[hidden] { display: none; }
+        #toast { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); z-index: 1500; max-width: min(520px, calc(100% - 24px)); padding: 10px 14px; border-radius: 8px; font-size: 13px; background: #232d3f; border: 1px solid #2e3b52; color: #fff; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45); }
+        #toast[hidden] { display: none; }
+
         /* --- Stickers and GIF picker (Issue #40) --- */
         #gif-picker-dialog { width: min(720px, calc(100% - 24px)); max-height: 86vh; margin: auto; padding: 18px; border: 1px solid #2e3b52; border-radius: 12px; background: #1a2332; color: #fff; }
         #gif-picker-dialog::backdrop { background: rgba(0, 0, 0, 0.72); }
@@ -264,6 +276,13 @@
     </style>
 </head>
 <body>
+    <!-- Connection status (FR-21) -->
+    <div id="conn-banner" hidden role="status" aria-live="polite">
+        <span id="conn-banner-text"></span>
+        <button type="button" id="conn-banner-retry" onclick="manualReconnect()">Retry now</button>
+    </div>
+    <div id="toast" hidden role="status" aria-live="polite"></div>
+
     <!-- Login / Registration -->
     <div id="auth-screen">
         <div class="auth-card">
@@ -475,10 +494,12 @@
                     alert('Browser storage is unavailable. This message may not survive a page refresh.');
                 }
             }
+            refreshConnBanner();
         }
 
         function removeFromOutbox(msgId) {
             saveOutbox(readOutbox().filter(item => item.msg_id !== msgId));
+            refreshConnBanner();
         }
 
         function setMessageStatus(msgId, label, title) {
@@ -526,13 +547,366 @@
             saveOutbox(outbox);
         }
 
-        function scheduleReconnect() {
-            if (reconnectTimer || !authToken || !currentUser) return;
+        // ================= Reconnection handling (FR-21) =================
+        // - Automatic reconnect with exponential backoff + jitter (no attempt limit).
+        // - Heartbeat (ping/pong) so a silently dead connection is noticed.
+        // - Immediate retry when the browser reports it is back online / the tab returns.
+        // - Queued messages are re-sent on reconnect (outbox, de-duplicated by the server).
+        // - Messages that arrived while disconnected are fetched from the server.
+        const RECONNECT_BASE_MS = 1000;
+        const RECONNECT_MAX_MS = 30000;
+        const CONNECT_TIMEOUT_MS = 10000;
+        const STABLE_AFTER_MS = 3000;
+        const HEARTBEAT_INTERVAL_MS = 20000;
+        const HEARTBEAT_TIMEOUT_MS = 10000;
+        const LAST_SEEN_PREFIX = 'chat_last_seen_id:';
+
+        let reconnectAttempts = 0;
+        let connectTimer = null;
+        let stableTimer = null;
+        let heartbeatTimer = null;
+        let pongTimer = null;
+        let outboxRetryTimer = null;
+        let bannerHideTimer = null;
+        let toastTimer = null;
+        let connReplaced = false;        // another tab/window took over this account's connection
+        let wasDisconnected = false;     // true from the moment the link drops until it is back
+        let connState = 'hidden';
+        let lastSeenMsgId = null;        // newest incoming message id this tab has seen (sync cursor)
+        let syncRunning = false;
+        const recentLiveIds = new Set();
+
+        function wsOpen() {
+            return !!ws && ws.readyState === WebSocket.OPEN;
+        }
+
+        function clearConnTimers() {
+            clearTimeout(connectTimer); connectTimer = null;
+            clearTimeout(stableTimer); stableTimer = null;
+            clearInterval(heartbeatTimer); heartbeatTimer = null;
+            clearTimeout(pongTimer); pongTimer = null;
+        }
+
+        // Close the current socket without triggering its handlers.
+        function dropSocket() {
+            clearConnTimers();
+            if (ws) {
+                ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+                try { ws.close(); } catch (e) {}
+                ws = null;
+            }
+        }
+
+        function resetConnectionState() {
+            dropSocket();
+            clearTimeout(reconnectTimer); reconnectTimer = null;
+            clearTimeout(outboxRetryTimer); outboxRetryTimer = null;
+            reconnectDelay = RECONNECT_BASE_MS;
+            reconnectAttempts = 0;
+            connReplaced = false;
+            wasDisconnected = false;
+            syncRunning = false;
+            lastSeenMsgId = null;
+            recentLiveIds.clear();
+            setConnState('hidden');
+        }
+
+        // ---------- status banner and toast ----------
+        function setConnState(state) {
+            connState = state;
+            clearTimeout(bannerHideTimer);
+            const banner = document.getElementById('conn-banner');
+            if (!banner) return;
+            if (state === 'hidden' || !currentUser) { banner.hidden = true; return; }
+            renderConnBanner();
+            if (state === 'connected') {
+                bannerHideTimer = setTimeout(() => { if (connState === 'connected') setConnState('hidden'); }, 3000);
+            }
+        }
+
+        function renderConnBanner() {
+            const banner = document.getElementById('conn-banner');
+            const text = document.getElementById('conn-banner-text');
+            const retry = document.getElementById('conn-banner-retry');
+            if (!banner || !text || !retry) return;
+            const queued = readOutbox().length;
+            const queuedNote = queued ? ` ${queued} message${queued === 1 ? '' : 's'} will be sent automatically.` : '';
+            banner.className = connState;
+            retry.hidden = false;
+            retry.textContent = 'Retry now';
+            if (connState === 'offline') {
+                text.textContent = 'You are offline. Reconnecting when the network is back.' + queuedNote;
+            } else if (connState === 'reconnecting') {
+                text.textContent = `Connection lost. Reconnecting (attempt ${Math.max(reconnectAttempts, 1)})…` + queuedNote;
+            } else if (connState === 'replaced') {
+                text.textContent = 'This account is open in another tab or window.' + queuedNote;
+                retry.textContent = 'Use here';
+            } else {
+                text.textContent = 'Back online.';
+                retry.hidden = true;
+            }
+            banner.hidden = false;
+        }
+
+        function refreshConnBanner() {
+            if (connState === 'reconnecting' || connState === 'offline' || connState === 'replaced') renderConnBanner();
+        }
+
+        function showToast(message, ms = 6000) {
+            const toast = document.getElementById('toast');
+            if (!toast) return;
+            toast.textContent = message;
+            toast.hidden = false;
+            clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => { toast.hidden = true; }, ms);
+        }
+
+        // ---------- reconnect scheduling ----------
+        function scheduleReconnect(immediate = false) {
+            if (reconnectTimer || !authToken || !currentUser || connReplaced) return;
+            wasDisconnected = true;
+            reconnectAttempts += 1;
+            const delay = immediate ? 0 : Math.round(reconnectDelay * (0.75 + Math.random() * 0.5));
+            setConnState(navigator.onLine === false ? 'offline' : 'reconnecting');
             reconnectTimer = setTimeout(() => {
                 reconnectTimer = null;
                 initWebSocket();
-            }, reconnectDelay);
-            reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+            }, delay);
+            if (!immediate) reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+        }
+
+        // "Retry now" / "Use here" button.
+        function manualReconnect() {
+            if (!authToken || !currentUser) return;
+            clearTimeout(reconnectTimer); reconnectTimer = null;
+            reconnectDelay = RECONNECT_BASE_MS;
+            connReplaced = false;
+            if (wsOpen()) { sendPing(); return; }
+            initWebSocket();
+        }
+
+        // ---------- heartbeat ----------
+        function startHeartbeat() {
+            clearInterval(heartbeatTimer);
+            heartbeatTimer = setInterval(sendPing, HEARTBEAT_INTERVAL_MS);
+        }
+
+        function sendPing() {
+            if (!wsOpen()) return;
+            try {
+                ws.send(JSON.stringify({ type: 'ping' }));
+            } catch (error) {
+                forceReconnect();
+                return;
+            }
+            clearTimeout(pongTimer);
+            pongTimer = setTimeout(forceReconnect, HEARTBEAT_TIMEOUT_MS);
+        }
+
+        // The link looks dead (no pong, send failed): throw it away and reconnect.
+        function forceReconnect() {
+            if (!authToken || !currentUser) return;
+            dropSocket();
+            wasDisconnected = true;
+            clearTimeout(reconnectTimer); reconnectTimer = null;
+            scheduleReconnect(reconnectAttempts === 0);
+        }
+
+        // ---------- sending while the link may be down ----------
+        // Queue in the outbox first (survives refresh), then transmit if connected.
+        function dispatchQueuedMessage(payload) {
+            queueOutgoingMessage(payload);
+            if (wsOpen()) {
+                if (transmitQueuedMessage(payload)) {
+                    const outbox = readOutbox();
+                    const queued = outbox.find(item => item.msg_id === payload.msg_id);
+                    if (queued) {
+                        queued.attempts = (queued.attempts || 0) + 1;
+                        queued.lastAttemptAt = Date.now();
+                        saveOutbox(outbox);
+                    }
+                }
+            } else {
+                setMessageStatus(payload.msg_id, '…', 'Queued; waiting for connection');
+                initWebSocket();
+            }
+        }
+
+        function scheduleOutboxRetry() {
+            if (outboxRetryTimer) return;
+            outboxRetryTimer = setTimeout(() => { outboxRetryTimer = null; flushOutbox(); }, 3000);
+        }
+
+        // ---------- missed-message sync ----------
+        function lastSeenKey() { return LAST_SEEN_PREFIX + currentUser; }
+
+        function loadLastSeenId() {
+            lastSeenMsgId = null;
+            try {
+                const value = localStorage.getItem(lastSeenKey());
+                const parsed = value === null ? NaN : parseInt(value, 10);
+                lastSeenMsgId = Number.isNaN(parsed) ? null : parsed;
+            } catch (e) {}
+        }
+
+        function noteSeenId(id) {
+            if (typeof id !== 'number' || !currentUser) return;
+            if (lastSeenMsgId === null || id > lastSeenMsgId) {
+                lastSeenMsgId = id;
+                try { localStorage.setItem(lastSeenKey(), String(id)); } catch (e) {}
+            }
+        }
+
+        function rememberLiveId(msgId) {
+            if (!msgId) return;
+            recentLiveIds.add(msgId);
+            if (recentLiveIds.size > 500) recentLiveIds.delete(recentLiveIds.values().next().value);
+        }
+
+        async function syncMissedMessages(afterOutage) {
+            if (syncRunning || !authToken || !currentUser) return;
+            syncRunning = true;
+            const user = currentUser;
+            const perSender = {};
+            let total = 0;
+            let activeChatAffected = false;
+            try {
+                let since = lastSeenMsgId === null ? -1 : lastSeenMsgId;
+                for (let page = 0; page < 50; page++) {
+                    const response = await window.fetch(`/api/messages/sync?since=${since}`);
+                    const data = await readJsonResult(response);
+                    if (user !== currentUser) return;          // logged out / switched user meanwhile
+                    (data.messages || []).forEach(msg => {
+                        noteSeenId(msg.id);
+                        if (recentLiveIds.has(msg.msg_id)) return;   // already received live
+                        total += 1;
+                        perSender[msg.sender] = (perSender[msg.sender] || 0) + 1;
+                        if (activeContact === msg.sender) {
+                            activeChatAffected = true;
+                            if (wsOpen()) {
+                                try {
+                                    ws.send(JSON.stringify({ type: 'read_ack', msg_id: msg.msg_id, sender: msg.sender, reader: currentUser }));
+                                } catch (e) {}
+                            }
+                        }
+                    });
+                    if (typeof data.latest_id === 'number') {
+                        since = data.latest_id;
+                        if (since >= 0) noteSeenId(since);
+                    }
+                    if (!data.has_more) break;
+                }
+            } catch (error) {
+                console.warn('Could not sync missed messages:', error);
+            } finally {
+                syncRunning = false;
+            }
+
+            if (user !== currentUser) return;
+            if (total > 0) {
+                const names = Object.keys(perSender).map(name => displayNameOf(name));
+                showToast(`${total} new message${total === 1 ? '' : 's'} received while you were offline (${names.join(', ')}).`);
+            }
+            if (afterOutage) {
+                loadContacts().catch(() => {});                 // refresh contacts and pending requests
+            }
+            if ((afterOutage || activeChatAffected) && activeContact) {
+                loadHistory();                                   // shows missed messages and current statuses
+            }
+        }
+
+        // ---------- socket lifecycle ----------
+        function initWebSocket() {
+            if (!authToken || !currentUser) return;
+            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+            connReplaced = false;
+            dropSocket();     // discard any closed socket object and stale timers
+            const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            let socket;
+            try {
+                socket = new WebSocket(`${scheme}://${window.location.host}/ws/${currentUser}?token=${encodeURIComponent(authToken)}`);
+            } catch (error) {
+                console.error('Could not create WebSocket connection:', error);
+                scheduleReconnect();
+                return;
+            }
+            ws = socket;
+            // A connection attempt that hangs is abandoned so the next one can start.
+            connectTimer = setTimeout(() => {
+                if (ws === socket && socket.readyState === WebSocket.CONNECTING) {
+                    try { socket.close(); } catch (e) {}
+                }
+            }, CONNECT_TIMEOUT_MS);
+
+            socket.onopen = function() {
+                clearTimeout(connectTimer); connectTimer = null;
+                const recovered = wasDisconnected;
+                wasDisconnected = false;
+                // Only treat the link as healthy once it has stayed up for a moment,
+                // so a server that accepts and immediately drops cannot cause a hot loop.
+                clearTimeout(stableTimer);
+                stableTimer = setTimeout(() => {
+                    reconnectDelay = RECONNECT_BASE_MS;
+                    reconnectAttempts = 0;
+                }, STABLE_AFTER_MS);
+                setConnState(recovered ? 'connected' : 'hidden');
+                startHeartbeat();
+                reportVisibility();
+                flushOutbox();                    // re-send queued messages
+                syncMissedMessages(recovered);    // fetch what arrived while disconnected
+            };
+            socket.onmessage = function(event) {
+                clearTimeout(pongTimer); pongTimer = null;    // any traffic proves the link is alive
+                try {
+                    handleIncomingSignal(JSON.parse(event.data));
+                } catch (error) {
+                    console.error('Ignoring invalid server message:', error);
+                }
+            };
+            socket.onerror = function(error) {
+                console.warn('WebSocket connection error:', error);
+            };
+            socket.onclose = function(event) {
+                clearConnTimers();
+                if (ws === socket) ws = null;
+                if (!authToken) return;
+                if (event.code === 4401 || event.code === 4403) {
+                    endSession('Session expired. Please log in again.');
+                    return;
+                }
+                wasDisconnected = true;
+                if (event.code === 4001) {
+                    // Another tab/window connected for this account. Do not fight over it.
+                    connReplaced = true;
+                    setConnState('replaced');
+                    return;
+                }
+                scheduleReconnect(reconnectAttempts === 0);
+            };
+        }
+
+        function initReconnectListeners() {
+            window.addEventListener('online', () => {
+                if (!authToken || !currentUser) return;
+                clearTimeout(reconnectTimer); reconnectTimer = null;
+                reconnectDelay = RECONNECT_BASE_MS;
+                if (wsOpen()) sendPing(); else if (!connReplaced) initWebSocket();
+            });
+            window.addEventListener('offline', () => {
+                if (!authToken || !currentUser || connReplaced) return;
+                // The old connection cannot be trusted; drop it and wait for the network.
+                dropSocket();
+                clearTimeout(reconnectTimer); reconnectTimer = null;
+                reconnectDelay = RECONNECT_BASE_MS;
+                scheduleReconnect(false);
+            });
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState !== 'visible' || !authToken || !currentUser || connReplaced) return;
+                if (wsOpen()) { sendPing(); return; }
+                clearTimeout(reconnectTimer); reconnectTimer = null;
+                reconnectDelay = RECONNECT_BASE_MS;
+                initWebSocket();
+            });
         }
  
         // ================= Authentication & session handling =================
@@ -753,6 +1127,8 @@
             document.getElementById('chat-header').innerText = 'Select a contact to begin messaging';
             document.getElementById('messages-list').innerHTML = '';
             lastActivity = Date.now();
+            resetConnectionState();
+            loadLastSeenId();
             initWebSocket();
             Promise.all([loadMuted(), loadBlocked()]).finally(loadContacts);   // load safety settings before rendering the contact actions
             clearInterval(idleTimer);
@@ -767,7 +1143,8 @@
                 clearTimeout(reconnectTimer);
                 reconnectTimer = null;
             }
-            if (ws) { ws.onmessage = null; ws.onclose = null; ws.close(); ws = null; }
+            dropSocket();
+            resetConnectionState();
             authToken = null;
             currentUser = null;
             activeContact = null;
@@ -836,41 +1213,7 @@
         }
  
         // ================= Chat application =================
-        function initWebSocket() {
-            if (!authToken || !currentUser) return;
-            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-            const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
-            try {
-                ws = new WebSocket(`${scheme}://${window.location.host}/ws/${currentUser}?token=${encodeURIComponent(authToken)}`);
-            } catch (error) {
-                console.error('Could not create WebSocket connection:', error);
-                scheduleReconnect();
-                return;
-            }
-            ws.onopen = function() {
-                reconnectDelay = 1000;
-                reportVisibility();
-                flushOutbox();
-            };
-            ws.onmessage = function(event) {
-                try {
-                    handleIncomingSignal(JSON.parse(event.data));
-                } catch (error) {
-                    console.error('Ignoring invalid server message:', error);
-                }
-            };
-            ws.onerror = function(error) {
-                console.warn('WebSocket connection error:', error);
-            };
-            ws.onclose = function(event) {
-                if (authToken && (event.code === 4401 || event.code === 4403)) {
-                    endSession('Session expired. Please log in again.');
-                    return;
-                }
-                scheduleReconnect();
-            };
-        }
- 
+
         // ================= Push notifications & mute (FR-19) =================
         const pushSupported = ('serviceWorker' in navigator) && ('PushManager' in window) && ('Notification' in window);
         let pushRegistration = null;
@@ -1586,7 +1929,10 @@
  
         // --- Receive Text Message Event Handler (ADDED FOR ISSUE #20) ---
         function handleIncomingSignal(data) {
+            if (data.type === "pong") return;     // heartbeat reply (FR-21)
             if (data.type === "receive_message") {
+                noteSeenId(data.id);
+                rememberLiveId(data.msg_id);
                 if (activeContact === data.sender) {
                     appendMessageUI(data.sender, data.content, data.timestamp, 'delivered', data.msg_id);
                     
@@ -1604,6 +1950,12 @@
                 }
             }
             else if (data.type === "error") {
+                if (data.msg_id && data.retryable) {
+                    // Temporary server-side problem: keep the message queued and try again shortly.
+                    setMessageStatus(data.msg_id, '!', (data.message || 'Message could not be saved.') + ' It will be retried automatically.');
+                    scheduleOutboxRetry();
+                    return;
+                }
                 if (data.msg_id) {
                     removeFromOutbox(data.msg_id);
                     setMessageStatus(data.msg_id, '×', data.message || 'Message was not sent');
@@ -2277,8 +2629,9 @@
                         timestamp: timeStr
                     };
  
-                    ws.send(JSON.stringify(payload));
-                    appendMessageUI(currentUser, formattedContent, timeStr, 'sent', msgId);
+                    appendMessageUI(currentUser, formattedContent, timeStr, 'sending', msgId);
+                    setMessageStatus(msgId, '…', 'Waiting for server status');
+                    dispatchQueuedMessage(payload);     // queued + re-sent after a reconnect (FR-21)
                 } else {
                     alert("File upload failed!");
                 }
@@ -2343,6 +2696,7 @@
             initImageEventDelegation();
             captureChatLink();      // FR-19: #chat=user from a notification click
             initPushListeners();
+            initReconnectListeners();   // FR-21: online/offline/tab-visible handling
             ['mousemove', 'keydown', 'click', 'touchstart', 'scroll'].forEach(name =>
                 document.addEventListener(name, trackActivity, { passive: true, capture: true })
             );
