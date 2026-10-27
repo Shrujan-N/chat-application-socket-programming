@@ -126,6 +126,141 @@
         .link-btn { background: none; border: none; padding: 0; color: #53bdeb; font-weight: normal; font-size: 13px; text-decoration: underline; cursor: pointer; }
         .link-btn:hover { background: none; color: #8fd3f4; }
         .auth-form .secondary { background: #232d3f; margin-top: 8px; }
+
+        /* Issue #49 cross-device portability */
+        html { height: 100%; }
+        body {
+            min-width: 0;
+            min-height: 0;
+            height: 100vh;
+            height: 100dvh;
+            overflow: hidden;
+        }
+        #sidebar, #chat-area { min-width: 0; min-height: 0; }
+        #contacts-list, #messages-list {
+            min-width: 0;
+            min-height: 0;
+            overscroll-behavior: contain;
+        }
+        input, select, textarea { font-size: 16px; }
+        button { touch-action: manipulation; }
+        #mobile-chat-nav { display: none; }
+
+        @media (pointer: coarse) {
+            button { min-height: 44px; }
+            .contact-item { touch-action: manipulation; }
+        }
+
+        @media (min-width: 701px) and (max-width: 900px) {
+            #sidebar { width: 280px; flex: 0 0 280px; }
+            .message { max-width: 78%; }
+        }
+
+        @media (max-width: 700px) {
+            body {
+                width: 100%;
+                height: 100vh;
+                height: 100dvh;
+                overflow: hidden;
+            }
+            #sidebar {
+                width: 100%;
+                min-width: 0;
+                min-height: 0;
+                flex: 1 1 100%;
+                border-right: 0;
+            }
+            #chat-area {
+                display: none;
+                width: 100%;
+                min-width: 0;
+                min-height: 0;
+                flex: 1 1 100%;
+            }
+            body.mobile-chat-open #sidebar { display: none; }
+            body.mobile-chat-open #chat-area { display: flex; }
+
+            #sidebar > .header {
+                flex-wrap: wrap;
+                gap: 8px;
+                padding: 12px;
+            }
+            #sidebar > .header > div:first-child {
+                flex: 1 1 auto;
+                min-width: 0;
+                flex-wrap: wrap;
+                gap: 6px;
+            }
+            #current-user-label { max-width: 25vw; }
+
+            #mobile-chat-nav {
+                display: flex;
+                align-items: center;
+                flex: 0 0 auto;
+                padding: calc(8px + env(safe-area-inset-top, 0px)) 10px 8px;
+                background: #1a2332;
+                border-bottom: 1px solid #2e3b52;
+            }
+            #mobile-chat-back {
+                min-height: 44px;
+                padding: 10px 14px;
+                background: #374151;
+            }
+            #chat-header {
+                flex: 0 0 auto;
+                min-width: 0;
+                padding: 12px;
+                line-height: 1.4;
+                overflow-wrap: anywhere;
+            }
+            #contacts-list, #messages-list {
+                min-height: 0;
+                overscroll-behavior: contain;
+            }
+            .contact-item { min-width: 0; }
+            .message { max-width: 88%; }
+
+            #input-area {
+                display: grid;
+                grid-template-columns: 44px minmax(46px, 56px) 54px minmax(0, 1fr) 58px;
+                align-items: center;
+                gap: 6px;
+                padding: 8px 8px calc(8px + env(safe-area-inset-bottom, 0px));
+            }
+            #input-area > button {
+                width: 100%;
+                min-width: 0;
+                min-height: 44px;
+                padding: 8px 4px;
+                overflow: hidden;
+            }
+            #input-area #gif-picker-open { font-size: 11px; }
+            #input-area #message-input {
+                grid-column: 4;
+                grid-row: 1;
+                min-width: 0;
+                width: 100%;
+                padding: 10px 8px;
+                font-size: 16px;
+            }
+            #input-area > button:last-child {
+                grid-column: 5;
+                grid-row: 1;
+            }
+            #input-area #voice-record-status {
+                grid-column: 1 / -1;
+                max-width: none;
+                font-size: 12px;
+                overflow-wrap: anywhere;
+            }
+
+            #gif-picker-dialog {
+                max-height: calc(100dvh - 24px);
+                max-width: calc(100% - 20px);
+            }
+            #gif-results { max-height: 48dvh; }
+        }
+
     </style>
 </head>
 <body>
@@ -212,7 +347,10 @@
         <div id="contacts-list"></div>
     </div>
     <div id="chat-area">
-        <div class="header" id="chat-header">Select a contact to begin messaging</div>
+        <div id="mobile-chat-nav">
+        <button type="button" id="mobile-chat-back" onclick="showMobileContacts()" aria-label="Back to contacts">&#8592; Contacts</button>
+    </div>
+    <div class="header" id="chat-header">Select a contact to begin messaging</div>
         <div id="messages-list"></div>
         <div id="input-area">
             <input type="file" id="file-input" style="display:none;" onchange="uploadFile()">
@@ -1386,14 +1524,24 @@
  
             if (activeContact === contactName) {
                 activeContact = null;
+                document.body.classList.remove('mobile-chat-open');
                 document.getElementById('chat-header').innerText = 'Select a contact to begin messaging';
                 document.getElementById('messages-list').innerHTML = '';
             }
             loadContacts();
         }
  
+        function showMobileContacts() {
+            document.body.classList.remove('mobile-chat-open');
+        }
+
         function selectContact(contact) {
             activeContact = contact;
+            if (window.matchMedia && window.matchMedia('(max-width: 700px)').matches) {
+                document.body.classList.add('mobile-chat-open');
+            } else {
+                document.body.classList.remove('mobile-chat-open');
+            }
             updateOnboardingGuide();
             updateChatHeader();
             loadContacts();
