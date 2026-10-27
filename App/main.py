@@ -4,6 +4,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 import asyncio
 import logging
 from message_integrity import content_sha256, verify_content_sha256
+import performance as performance_metrics
 from availability import check_database_connection, get_availability_summary
 import time
 import os
@@ -303,6 +304,14 @@ async def availability_overview():
         ) if total else 0.0,
     }
     return summary
+
+
+# --- Performance / Latency measurements (NFR-01) ---
+@app.get("/api/performance/latency")
+async def performance_latency_summary():
+    # Auth is enforced by the existing /api middleware.
+    performance_metrics.expire_pending_deliveries()
+    return performance_metrics.get_latency_summary()
 
 
 # Mount Static Files and Uploads
@@ -769,6 +778,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
             message_type = data.get("type")
 
             if message_type == "send_message":
+                delivery_started_at = time.perf_counter()
                 recipient = data.get("recipient")
                 content = data.get("content")
                 msg_id = data.get("msg_id") or os.urandom(16).hex()
@@ -867,11 +877,15 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     }
                     recipient_socket = manager.active_connections.get(recipient)
                     if recipient_socket is not None:
+                        performance_metrics.begin_delivery(
+                            msg_id, username, recipient, started_at=delivery_started_at
+                        )
                         try:
                             await recipient_socket.send_json(incoming_frame)
                             await websocket.send_json({"type": "status_update", "msg_id": msg_id, "status": "delivered"})
                             mark_messages_delivered([msg_id])
                         except Exception:
+                            performance_metrics.cancel_pending_delivery(msg_id, recipient)
                             logger.exception("Live message delivery failed: recipient=%s", recipient)
                             manager.disconnect(recipient, recipient_socket)
                             try:
@@ -891,6 +905,32 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
             elif message_type == "ping":
                 # Heartbeat (FR-21): lets the client detect a dead connection quickly.
                 await websocket.send_json({"type": "pong"})
+
+            elif message_type == "delivery_ack":
+                msg_id = data.get("msg_id")
+                if not isinstance(msg_id, str) or not msg_id.strip():
+                    continue
+                completed = performance_metrics.complete_delivery_ack(msg_id.strip(), recipient=username)
+                if completed is None:
+                    continue
+                sender_socket = manager.active_connections.get(completed["sender"])
+                if sender_socket is not None:
+                    try:
+                        await sender_socket.send_json({
+                            "type": "performance_metric",
+                            "msg_id": completed["message_id"],
+                            "server_delivery_latency_ms": completed["server_latency_ms"],
+                            "target_ms": performance_metrics.LATENCY_TARGET_MS,
+                        })
+                    except Exception:
+                        logger.debug("Could not send latency result to sender", exc_info=True)
+                        manager.disconnect(completed["sender"], sender_socket)
+
+            elif message_type == "latency_report":
+                msg_id = data.get("msg_id")
+                latency_ms = data.get("latency_ms")
+                if isinstance(msg_id, str) and msg_id.strip():
+                    performance_metrics.record_client_latency_report(msg_id.strip(), sender=username, latency_ms=latency_ms)
 
             elif message_type == "read_ack":
                 sender = data.get("sender")
