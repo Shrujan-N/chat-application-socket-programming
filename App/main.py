@@ -4,6 +4,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 import asyncio
 import logging
 from message_integrity import content_sha256, verify_content_sha256
+from availability import check_database_connection, get_availability_summary
 import time
 import os
 import re
@@ -258,6 +259,52 @@ async def diagnostics_summary():
     }
  
  
+# --- Availability / Uptime monitoring (NFR-03) ---
+@app.get("/health/live")
+async def liveness_probe():
+    """Return success while the web process is able to handle requests."""
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+async def readiness_probe():
+    """Check database dependencies needed by the chat application."""
+    checks = {
+        "core_database": check_database_connection(core_get_db),
+        "web_database": check_database_connection(get_db),
+    }
+    ready = all(checks.values())
+    payload = {
+        "status": "ready" if ready else "not_ready",
+        "checks": {
+            name: ("ok" if available else "failed")
+            for name, available in checks.items()
+        },
+    }
+    if not ready:
+        logger.error("Readiness probe failed: checks=%s", payload["checks"])
+    return JSONResponse(status_code=200 if ready else 503, content=payload)
+
+
+@app.get("/api/availability")
+async def availability_overview():
+    """Return authenticated rolling SLO measurements and existing request metrics."""
+    summary = get_availability_summary(server_started_at=SERVER_STARTED_AT)
+    total = REQUEST_METRICS["total_requests"]
+    summary["request_metrics"] = {
+        "total_requests": total,
+        "server_errors": REQUEST_METRICS["server_errors"],
+        "server_error_rate_percent": round(
+            REQUEST_METRICS["server_errors"] / total * 100.0, 3
+        ) if total else 0.0,
+        "slow_requests": REQUEST_METRICS["slow_requests"],
+        "average_response_ms": round(
+            REQUEST_METRICS["total_duration_ms"] / total, 2
+        ) if total else 0.0,
+    }
+    return summary
+
+
 # Mount Static Files and Uploads
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
  
