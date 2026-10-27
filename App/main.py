@@ -3,6 +3,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 import asyncio
 import logging
+from message_integrity import content_sha256, verify_content_sha256
 import time
 import os
 import re
@@ -554,14 +555,41 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+# DATA_INTEGRITY_ISSUE_45: ordered per-recipient processing.
+# SQLite persistence and live delivery for one recipient use the same lock, so
+# concurrent senders cannot cause later persisted messages to be sent first.
+recipient_delivery_locks: Dict[str, asyncio.Lock] = {}
+
+
+def get_recipient_delivery_lock(recipient: str) -> asyncio.Lock:
+    return recipient_delivery_locks.setdefault(recipient, asyncio.Lock())
+
+
+def assert_message_integrity(rows) -> None:
+    """Reject damaged stored messages rather than silently returning bad content."""
+    for row in rows:
+        if not verify_content_sha256(row["content"], row["integrity_hash"]):
+            msg_id = row["msg_id"] if "msg_id" in row.keys() else "unknown"
+            logger.error("DATA_INTEGRITY_ISSUE_45: checksum mismatch for message %s", msg_id)
+            raise HTTPException(
+                status_code=500,
+                detail="A stored message failed integrity verification. Please contact support.",
+            )
+
+
 def persist_websocket_message(
     msg_id: str,
     sender: str,
     recipient: str,
     content: str,
     timestamp: str,
+    integrity_hash: Optional[str] = None,
 ):
     """Persist a message once; identical retries are safe and idempotent."""
+    expected_hash = content_sha256(content)
+    if integrity_hash is not None and not verify_content_sha256(content, integrity_hash):
+        raise ValueError("Message content checksum mismatch")
+    integrity_hash = expected_hash
     conn = None
     try:
         conn = get_db()
@@ -569,17 +597,17 @@ def persist_websocket_message(
         cursor = conn.execute(
             """
             INSERT OR IGNORE INTO messages
-                (msg_id, sender, recipient, content, timestamp, status)
-            VALUES (?, ?, ?, ?, ?, 'sent')
+                (msg_id, sender, recipient, content, timestamp, status, integrity_hash)
+            VALUES (?, ?, ?, ?, ?, 'sent', ?)
             """,
-            (msg_id, sender, recipient, content, timestamp),
+            (msg_id, sender, recipient, content, timestamp, integrity_hash),
         )
         inserted = cursor.rowcount == 1
 
         if not inserted:
             existing = conn.execute(
                 """
-                SELECT sender, recipient, content
+                SELECT sender, recipient, content, timestamp, integrity_hash
                 FROM messages
                 WHERE msg_id = ?
                 """,
@@ -589,6 +617,8 @@ def persist_websocket_message(
                 existing["sender"] != sender
                 or existing["recipient"] != recipient
                 or existing["content"] != content
+                or existing["timestamp"] != timestamp
+                or not verify_content_sha256(existing["content"], existing["integrity_hash"])
             ):
                 raise ValueError("Message ID conflicts with an existing message")
 
@@ -616,7 +646,7 @@ def get_message_row_id(msg_id: str):
     conn = None
     try:
         conn = get_db()
-        row = conn.execute("SELECT id FROM messages WHERE msg_id = ?", (msg_id,)).fetchone()
+        row = conn.execute("SELECT rowid AS id FROM messages WHERE msg_id = ?", (msg_id,)).fetchone()
         return row["id"] if row else None
     except sqlite3.Error:
         logger.exception("Could not look up message row id")
@@ -708,6 +738,18 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
 
                 recipient = recipient.strip()
                 msg_id = msg_id.strip()
+
+                # DATA_INTEGRITY_ISSUE_45: reject content changed after the client hashed it.
+                provided_integrity_hash = data.get("integrity_hash")
+                if provided_integrity_hash is not None and not verify_content_sha256(
+                    content, provided_integrity_hash
+                ):
+                    await websocket.send_json({
+                        "type": "error",
+                        "msg_id": msg_id,
+                        "message": "Message integrity verification failed; message was not sent.",
+                    })
+                    continue
                 try:
                     block_active = users_are_blocked(username, recipient)
                 except sqlite3.Error:
@@ -726,73 +768,75 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         "message": "Message not sent: a block is active between you and this user.",
                     })
                     continue
-                try:
-                    inserted = persist_websocket_message(
-                        msg_id, username, recipient, content, timestamp
-                    )
-                except ValueError:
-                    await websocket.send_json({
-                        "type": "error",
-                        "msg_id": msg_id,
-                        "message": "Message ID conflicts with an existing message.",
-                    })
-                    continue
-                except sqlite3.Error:
-                    await websocket.send_json({
-                        "type": "error",
-                        "msg_id": msg_id,
-                        "message": "Message could not be saved. Please retry.",
-                        "retryable": True,
-                    })
-                    continue
-                except Exception:
-                    logger.exception(
-                        "Unexpected message-processing failure: username=%s",
-                        username,
-                    )
-                    await websocket.send_json({
-                        "type": "error",
-                        "msg_id": msg_id,
-                        "message": "Message processing failed. Please retry.",
-                        "retryable": True,
-                    })
-                    continue
-
-                # A sent acknowledgment confirms durable server persistence, not recipient delivery.
-                await websocket.send_json({
-                    "type": "status_update",
-                    "msg_id": msg_id,
-                    "status": "sent",
-                })
-
-                # A duplicate retry was already persisted and must not be forwarded twice.
-                if not inserted:
-                    continue
-
-                incoming_frame = {
-                    "type": "receive_message", "msg_id": msg_id, "sender": username,
-                    "recipient": recipient, "content": content, "timestamp": timestamp,
-                    "id": get_message_row_id(msg_id),
-                }
-                recipient_socket = manager.active_connections.get(recipient)
-                if recipient_socket is not None:
+                async with get_recipient_delivery_lock(recipient):
                     try:
-                        await recipient_socket.send_json(incoming_frame)
-                        await websocket.send_json({"type": "status_update", "msg_id": msg_id, "status": "delivered"})
-                        mark_messages_delivered([msg_id])
+                        inserted = persist_websocket_message(
+                            msg_id, username, recipient, content, timestamp, provided_integrity_hash
+                        )
+                    except ValueError:
+                        await websocket.send_json({
+                            "type": "error",
+                            "msg_id": msg_id,
+                            "message": "Message ID conflicts with an existing message.",
+                        })
+                        continue
+                    except sqlite3.Error:
+                        await websocket.send_json({
+                            "type": "error",
+                            "msg_id": msg_id,
+                            "message": "Message could not be saved. Please retry.",
+                            "retryable": True,
+                        })
+                        continue
                     except Exception:
-                        logger.exception("Live message delivery failed: recipient=%s", recipient)
-                        manager.disconnect(recipient, recipient_socket)
+                        logger.exception(
+                            "Unexpected message-processing failure: username=%s",
+                            username,
+                        )
+                        await websocket.send_json({
+                            "type": "error",
+                            "msg_id": msg_id,
+                            "message": "Message processing failed. Please retry.",
+                            "retryable": True,
+                        })
+                        continue
+
+                    # A sent acknowledgment confirms durable server persistence, not recipient delivery.
+                    await websocket.send_json({
+                        "type": "status_update",
+                        "msg_id": msg_id,
+                        "status": "sent",
+                    })
+
+                    # A duplicate retry was already persisted and must not be forwarded twice.
+                    if not inserted:
+                        continue
+
+                    incoming_frame = {
+                        "type": "receive_message", "msg_id": msg_id, "sender": username,
+                        "recipient": recipient, "content": content, "timestamp": timestamp,
+                        "integrity_hash": content_sha256(content),
+                        "id": get_message_row_id(msg_id),
+                    }
+                    recipient_socket = manager.active_connections.get(recipient)
+                    if recipient_socket is not None:
                         try:
-                            await websocket.send_json({"type": "status_update", "msg_id": msg_id, "status": "sent"})
+                            await recipient_socket.send_json(incoming_frame)
+                            await websocket.send_json({"type": "status_update", "msg_id": msg_id, "status": "delivered"})
+                            mark_messages_delivered([msg_id])
                         except Exception:
-                            logger.debug("Could not send message status: username=%s", username, exc_info=True)
+                            logger.exception("Live message delivery failed: recipient=%s", recipient)
+                            manager.disconnect(recipient, recipient_socket)
+                            try:
+                                await websocket.send_json({"type": "status_update", "msg_id": msg_id, "status": "sent"})
+                            except Exception:
+                                logger.debug("Could not send message status: username=%s", username, exc_info=True)
 
-                if recipient not in manager.active_connections or not manager.visible.get(recipient, True):
-                    try:
-                        schedule_push(msg_id, username, recipient, content)
-                    except Exception:
-                        logger.exception("Failed to schedule push notification: recipient=%s", recipient)
+                    if recipient not in manager.active_connections or not manager.visible.get(recipient, True):
+                        try:
+                            schedule_push(msg_id, username, recipient, content)
+                        except Exception:
+                            logger.exception("Failed to schedule push notification: recipient=%s", recipient)
 
             elif message_type == "visibility":
                 manager.visible[username] = bool(data.get("visible"))
@@ -1256,14 +1300,20 @@ async def get_chat_history(user1: str, user2: str):
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT msg_id, sender, recipient, content, timestamp, status 
+        SELECT msg_id, sender, recipient, content, timestamp, status, integrity_hash 
         FROM messages 
         WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)
-        ORDER BY id ASC
+        ORDER BY rowid ASC
     """, (user1, user2, user2, user1))
     rows = cursor.fetchall()
     conn.close()
-    return {"history": [dict(row) for row in rows]}
+    assert_message_integrity(rows)
+    history = []
+    for row in rows:
+        item = dict(row)
+        item.pop("integrity_hash", None)
+        history.append(item)
+    return {"history": history}
 
 
 # --- Missed-message sync after a reconnect (FR-21) ---
@@ -1284,27 +1334,30 @@ async def sync_missed_messages(request: Request, since: int = -1):
     conn = get_db()
     try:
         latest = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE recipient = ?", (username,)
+            "SELECT COALESCE(MAX(rowid), 0) FROM messages WHERE recipient = ?", (username,)
         ).fetchone()[0]
         if since < 0:
             return {"messages": [], "latest_id": latest, "has_more": False}
 
         rows = conn.execute(
             """
-            SELECT id, msg_id, sender, recipient, content, timestamp, status
+            SELECT rowid AS id, msg_id, sender, recipient, content, timestamp, status, integrity_hash
             FROM messages
-            WHERE recipient = ? AND id > ?
-            ORDER BY id ASC
+            WHERE recipient = ? AND rowid > ?
+            ORDER BY rowid ASC
             LIMIT ?
             """,
             (username, since, SYNC_PAGE_LIMIT),
         ).fetchall()
+        assert_message_integrity(rows)
         messages = [dict(row) for row in rows]
+        for message in messages:
+            message.pop("integrity_hash", None)
 
         newly_delivered = [m for m in messages if m["status"] == "sent"]
         if newly_delivered:
             conn.executemany(
-                "UPDATE messages SET status = 'delivered' WHERE id = ? AND status = 'sent'",
+                "UPDATE messages SET status = 'delivered' WHERE rowid = ? AND status = 'sent'",
                 [(m["id"],) for m in newly_delivered],
             )
             conn.commit()
@@ -1413,12 +1466,17 @@ async def search_query(username: str, q: str):
  
     # 2. Search Messages matching content search term
     cursor.execute("""
-        SELECT msg_id, sender, recipient, content, timestamp 
+        SELECT msg_id, sender, recipient, content, timestamp, integrity_hash 
         FROM messages 
         WHERE (sender = ? OR recipient = ?) AND content LIKE ?
-        ORDER BY id DESC
+        ORDER BY rowid DESC
     """, (username, username, search_term))
-    messages = [dict(row) for row in cursor.fetchall()]
- 
+    message_rows = cursor.fetchall()
     conn.close()
+    assert_message_integrity(message_rows)
+    messages = []
+    for row in message_rows:
+        item = dict(row)
+        item.pop("integrity_hash", None)
+        messages.append(item)
     return {"contacts": contacts, "messages": messages}
