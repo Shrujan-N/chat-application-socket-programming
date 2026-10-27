@@ -609,6 +609,43 @@ def persist_websocket_message(
             except sqlite3.Error:
                 logger.exception("Failed to close message database connection")
 
+# --- Reconnection handling (FR-21) helpers ---
+def get_message_row_id(msg_id: str):
+    """Database row id of a stored message. Clients use it as a cursor so that,
+    after a reconnect, they can ask for everything they missed."""
+    conn = None
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT id FROM messages WHERE msg_id = ?", (msg_id,)).fetchone()
+        return row["id"] if row else None
+    except sqlite3.Error:
+        logger.exception("Could not look up message row id")
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def mark_messages_delivered(msg_ids):
+    """Persist 'delivered' so history and missed-message sync show the right status."""
+    ids = [m for m in msg_ids if m]
+    if not ids:
+        return
+    conn = None
+    try:
+        conn = get_db()
+        conn.executemany(
+            "UPDATE messages SET status = 'delivered' WHERE msg_id = ? AND status = 'sent'",
+            [(m,) for m in ids],
+        )
+        conn.commit()
+    except sqlite3.Error:
+        logger.exception("Could not mark messages as delivered")
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 @app.websocket("/ws/{username}")
 async def websocket_endpoint(websocket: WebSocket, username: str):
     try:
@@ -679,6 +716,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         "type": "error",
                         "msg_id": msg_id,
                         "message": "Message was not sent because block settings could not be verified. Please retry.",
+                        "retryable": True,
                     })
                     continue
                 if block_active:
@@ -704,6 +742,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         "type": "error",
                         "msg_id": msg_id,
                         "message": "Message could not be saved. Please retry.",
+                        "retryable": True,
                     })
                     continue
                 except Exception:
@@ -715,6 +754,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         "type": "error",
                         "msg_id": msg_id,
                         "message": "Message processing failed. Please retry.",
+                        "retryable": True,
                     })
                     continue
 
@@ -732,12 +772,14 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 incoming_frame = {
                     "type": "receive_message", "msg_id": msg_id, "sender": username,
                     "recipient": recipient, "content": content, "timestamp": timestamp,
+                    "id": get_message_row_id(msg_id),
                 }
                 recipient_socket = manager.active_connections.get(recipient)
                 if recipient_socket is not None:
                     try:
                         await recipient_socket.send_json(incoming_frame)
                         await websocket.send_json({"type": "status_update", "msg_id": msg_id, "status": "delivered"})
+                        mark_messages_delivered([msg_id])
                     except Exception:
                         logger.exception("Live message delivery failed: recipient=%s", recipient)
                         manager.disconnect(recipient, recipient_socket)
@@ -754,6 +796,10 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
 
             elif message_type == "visibility":
                 manager.visible[username] = bool(data.get("visible"))
+
+            elif message_type == "ping":
+                # Heartbeat (FR-21): lets the client detect a dead connection quickly.
+                await websocket.send_json({"type": "pong"})
 
             elif message_type == "read_ack":
                 sender = data.get("sender")
@@ -1218,6 +1264,72 @@ async def get_chat_history(user1: str, user2: str):
     rows = cursor.fetchall()
     conn.close()
     return {"history": [dict(row) for row in rows]}
+
+
+# --- Missed-message sync after a reconnect (FR-21) ---
+SYNC_PAGE_LIMIT = 200
+
+
+@app.get("/api/messages/sync")
+async def sync_missed_messages(request: Request, since: int = -1):
+    """Messages addressed to the logged-in user with a row id greater than `since`.
+
+    since < 0 only returns the current newest id (used the first time a device
+    syncs, so old history is not replayed as "new"). Pages of SYNC_PAGE_LIMIT;
+    has_more tells the client to call again with since=latest_id. Messages that
+    were still 'sent' become 'delivered', and their senders are told.
+    """
+    username = current_username(request)
+    newly_delivered = []
+    conn = get_db()
+    try:
+        latest = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE recipient = ?", (username,)
+        ).fetchone()[0]
+        if since < 0:
+            return {"messages": [], "latest_id": latest, "has_more": False}
+
+        rows = conn.execute(
+            """
+            SELECT id, msg_id, sender, recipient, content, timestamp, status
+            FROM messages
+            WHERE recipient = ? AND id > ?
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (username, since, SYNC_PAGE_LIMIT),
+        ).fetchall()
+        messages = [dict(row) for row in rows]
+
+        newly_delivered = [m for m in messages if m["status"] == "sent"]
+        if newly_delivered:
+            conn.executemany(
+                "UPDATE messages SET status = 'delivered' WHERE id = ? AND status = 'sent'",
+                [(m["id"],) for m in newly_delivered],
+            )
+            conn.commit()
+            for m in newly_delivered:
+                m["status"] = "delivered"
+    finally:
+        conn.close()
+
+    for m in newly_delivered:
+        sender_socket = manager.active_connections.get(m["sender"])
+        if sender_socket is None:
+            continue
+        try:
+            await sender_socket.send_json(
+                {"type": "status_update", "msg_id": m["msg_id"], "status": "delivered"}
+            )
+        except Exception:
+            logger.exception("Could not send delivery status after sync: sender=%s", m["sender"])
+            manager.disconnect(m["sender"], sender_socket)
+
+    return {
+        "messages": messages,
+        "latest_id": messages[-1]["id"] if messages else latest,
+        "has_more": len(messages) == SYNC_PAGE_LIMIT,
+    }
  
 # --- File & Image Attachment Multipart Upload Endpoint (ADDED FOR ISSUE #29) ---
 @app.post("/api/upload")
