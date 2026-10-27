@@ -511,6 +511,39 @@
             }
         }
 
+        // NFR-01: use a monotonic timer for live message delivery.
+        const performanceSendStartedAt = new Map();
+
+        function rememberPerformanceSendStart(msgId) {
+            if (!msgId || !window.performance || typeof performance.now !== 'function') return;
+            performanceSendStartedAt.set(msgId, performance.now());
+            while (performanceSendStartedAt.size > 1000) {
+                performanceSendStartedAt.delete(performanceSendStartedAt.keys().next().value);
+            }
+        }
+
+        function handlePerformanceMetric(data) {
+            const startedAt = performanceSendStartedAt.get(data.msg_id);
+            if (typeof startedAt !== 'number' || !window.performance) return;
+            const latencyMs = Math.max(0, performance.now() - startedAt);
+            performanceSendStartedAt.delete(data.msg_id);
+            const statusElement = document.getElementById(`status-${data.msg_id}`);
+            if (statusElement) {
+                statusElement.title = `End-to-end delivery: ${latencyMs.toFixed(1)} ms (target <= 200 ms)`;
+            }
+            if (wsOpen()) {
+                try {
+                    ws.send(JSON.stringify({
+                        type: 'latency_report',
+                        msg_id: data.msg_id,
+                        latency_ms: Number(latencyMs.toFixed(3))
+                    }));
+                } catch (error) {
+                    console.warn('Could not report measured message latency:', error);
+                }
+            }
+        }
+
         async function hashMessageContent(content) {
             if (!window.crypto || !window.crypto.subtle || !window.TextEncoder) {
                 throw new Error('Secure SHA-256 hashing is not supported in this browser context.');
@@ -525,6 +558,7 @@
                 setMessageStatus(message.msg_id, '…', 'Queued until the connection is available');
                 return false;
             }
+            if (!isRetry) rememberPerformanceSendStart(message.msg_id);
             try {
                 ws.send(JSON.stringify({
                     type: 'send_message',
@@ -1963,10 +1997,22 @@
 
         function handleIncomingSignalVerified(data) {
 
+            if (data.type === "performance_metric") {
+                handlePerformanceMetric(data);
+                return;
+            }
             if (data.type === "pong") return;     // heartbeat reply (FR-21)
             if (data.type === "receive_message") {
                 noteSeenId(data.id);
                 rememberLiveId(data.msg_id);
+                // ACK only after incoming content passed checksum verification.
+                if (wsOpen()) {
+                    try {
+                        ws.send(JSON.stringify({ type: "delivery_ack", msg_id: data.msg_id }));
+                    } catch (error) {
+                        console.warn("Could not acknowledge verified message delivery:", error);
+                    }
+                }
                 if (activeContact === data.sender) {
                     appendMessageUI(data.sender, data.content, data.timestamp, 'delivered', data.msg_id);
                     
