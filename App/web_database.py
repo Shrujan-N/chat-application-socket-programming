@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from message_integrity import content_sha256
 from pathlib import Path
 
 DB_PATH = Path(os.environ.get("CHAT_WEB_DB_PATH", os.environ.get("CHAT_DB_PATH", Path(__file__).resolve().parent / "chat_app.db"))).resolve()
@@ -30,7 +31,7 @@ def init_db():
           conversation_id TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL, recipient TEXT,
           group_id TEXT, content TEXT NOT NULL, timestamp TEXT NOT NULL,
           status TEXT NOT NULL DEFAULT 'sent', edited INTEGER NOT NULL DEFAULT 0,
-          edited_at TEXT, deleted_everyone INTEGER NOT NULL DEFAULT 0);
+          edited_at TEXT, deleted_everyone INTEGER NOT NULL DEFAULT 0, integrity_hash TEXT);
         CREATE TABLE IF NOT EXISTS message_receipts(
           msg_id TEXT NOT NULL, username TEXT NOT NULL, delivered_at TEXT, read_at TEXT,
           PRIMARY KEY(msg_id,username), FOREIGN KEY(msg_id) REFERENCES messages(msg_id) ON DELETE CASCADE);
@@ -118,11 +119,22 @@ def init_db():
           "conversation_type": "TEXT NOT NULL DEFAULT 'private'",
           "conversation_id": "TEXT NOT NULL DEFAULT ''",
           "group_id": "TEXT", "edited": "INTEGER NOT NULL DEFAULT 0",
-          "edited_at": "TEXT", "deleted_everyone": "INTEGER NOT NULL DEFAULT 0"
+          "edited_at": "TEXT", "deleted_everyone": "INTEGER NOT NULL DEFAULT 0",
+          "integrity_hash": "TEXT"
         }
         for name, definition in migrations.items():
             if name not in columns:
                 conn.execute(f"ALTER TABLE messages ADD COLUMN {name} {definition}")
+        # DATA_INTEGRITY_ISSUE_45: backfill legacy message hashes once.
+        legacy_messages = conn.execute(
+            "SELECT msg_id, content FROM messages WHERE integrity_hash IS NULL"
+        ).fetchall()
+        for legacy in legacy_messages:
+            conn.execute(
+                "UPDATE messages SET integrity_hash = ? WHERE msg_id = ?",
+                (content_sha256(legacy["content"]), legacy["msg_id"]),
+            )
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_type,conversation_id,timestamp)")
         for username, email in [
           ("shrujan","shrujan@example.com"),
