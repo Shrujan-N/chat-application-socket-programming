@@ -583,29 +583,96 @@ async def logout_user(request: Request):
     return {"success": True, "message": "Logged out."}
  
  
-# --- Active WebSocket Registry (Issue #19, #46) ---
+# --- Active WebSocket Registry (Issue #19, #46; Multi-device FR-26) ---
 class ConnectionManager:
+    """Track every live device socket while retaining the legacy primary-socket map."""
+
     def __init__(self):
+        # Kept for older callers/tests that expect one representative socket per user.
         self.active_connections: Dict[str, WebSocket] = {}
+        self.device_connections: Dict[str, list[WebSocket]] = {}
+        self.device_visibility: Dict[str, Dict[int, bool]] = {}
+        # Aggregate visibility means any active device is foreground/visible.
         self.visible: Dict[str, bool] = {}
 
     async def connect(self, username: str, websocket: WebSocket):
         await websocket.accept()
-        previous = self.active_connections.get(username)
+        devices = self.device_connections.setdefault(username, [])
+        if all(existing is not websocket for existing in devices):
+            devices.append(websocket)
+        self.device_visibility.setdefault(username, {})[id(websocket)] = True
         self.active_connections[username] = websocket
-        self.visible[username] = True
-        if previous is not None and previous is not websocket:
+        self._refresh_visibility(username)
+
+    def connections_for(self, username: str) -> list[WebSocket]:
+        """Return connected device sockets, including legacy direct-map entries."""
+        devices = list(self.device_connections.get(username, []))
+        primary = self.active_connections.get(username)
+        if primary is not None and all(existing is not primary for existing in devices):
+            devices.append(primary)
+        return devices
+
+    def _refresh_visibility(self, username: str) -> bool:
+        devices = self.connections_for(username)
+        if not devices:
+            self.visible.pop(username, None)
+            return False
+        per_device = self.device_visibility.get(username, {})
+        value = any(per_device.get(id(device), True) for device in devices)
+        self.visible[username] = value
+        return value
+
+    def set_visibility(self, username: str, websocket: WebSocket, visible: bool) -> None:
+        if all(existing is not websocket for existing in self.connections_for(username)):
+            return
+        self.device_visibility.setdefault(username, {})[id(websocket)] = bool(visible)
+        self._refresh_visibility(username)
+
+    async def broadcast_user(self, username: str, message: dict, *, exclude=None) -> int:
+        """Send a frame to all live device sockets; remove only sockets that failed."""
+        delivered = 0
+        for device in list(self.connections_for(username)):
+            if device is exclude:
+                continue
             try:
-                await previous.close(code=4001, reason="Connection replaced")
+                await device.send_json(message)
+                delivered += 1
             except Exception:
-                logger.warning("Failed to close replaced WebSocket: username=%s", username, exc_info=True)
+                logger.exception("WebSocket broadcast failed: username=%s", username)
+                self.disconnect(username, device)
+        return delivered
 
     def disconnect(self, username: str, websocket: Optional[WebSocket] = None):
-        current = self.active_connections.get(username)
-        if websocket is not None and current is not websocket:
+        # With no socket, keep the previous API behaviour and clear the user's registry.
+        if websocket is None:
+            self.active_connections.pop(username, None)
+            self.device_connections.pop(username, None)
+            self.device_visibility.pop(username, None)
+            self.visible.pop(username, None)
             return
-        self.active_connections.pop(username, None)
-        self.visible.pop(username, None)
+
+        devices = [
+            device for device in self.device_connections.get(username, [])
+            if device is not websocket
+        ]
+        visibility = self.device_visibility.get(username, {})
+        visibility.pop(id(websocket), None)
+        if devices:
+            self.device_connections[username] = devices
+        else:
+            self.device_connections.pop(username, None)
+
+        if self.active_connections.get(username) is websocket:
+            if devices:
+                self.active_connections[username] = devices[-1]
+            else:
+                self.active_connections.pop(username, None)
+        elif username not in self.active_connections and devices:
+            self.active_connections[username] = devices[-1]
+
+        if not self.device_connections.get(username):
+            self.device_visibility.pop(username, None)
+        self._refresh_visibility(username)
 
 
 manager = ConnectionManager()
@@ -727,6 +794,33 @@ def mark_messages_delivered(msg_ids):
         conn.commit()
     except sqlite3.Error:
         logger.exception("Could not mark messages as delivered")
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def mark_message_read(msg_id: str, sender: str, reader: str) -> bool:
+    """Persist a read receipt only when the connected reader owns the recipient side."""
+    conn = None
+    try:
+        conn = get_db()
+        row = conn.execute(
+            "SELECT sender, recipient FROM messages WHERE msg_id = ?", (msg_id,)
+        ).fetchone()
+        if row is None or row["sender"] != sender or row["recipient"] != reader:
+            return False
+        conn.execute("UPDATE messages SET status = 'read' WHERE msg_id = ?", (msg_id,))
+        conn.execute(
+            """INSERT INTO message_receipts (msg_id, username, read_at)
+               VALUES (?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(msg_id, username) DO UPDATE SET read_at = excluded.read_at""",
+            (msg_id, reader),
+        )
+        conn.commit()
+        return True
+    except sqlite3.Error:
+        logger.exception("Could not persist read receipt: msg_id=%s", msg_id)
+        return False
     finally:
         if conn is not None:
             conn.close()
@@ -858,11 +952,24 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         })
                         continue
 
+                    # MULTI_DEVICE_SYNC_FR26: mirror a new outgoing message to the
+                    # sender's other logged-in devices before sending the state update.
+                    if inserted:
+                        await manager.broadcast_user(username, {
+                            "type": "message_sync",
+                            "msg_id": msg_id,
+                            "sender": username,
+                            "recipient": recipient,
+                            "content": content,
+                            "timestamp": timestamp,
+                            "status": "sent",
+                            "integrity_hash": content_sha256(content),
+                            "id": get_message_row_id(msg_id),
+                        }, exclude=websocket)
+
                     # A sent acknowledgment confirms durable server persistence, not recipient delivery.
-                    await websocket.send_json({
-                        "type": "status_update",
-                        "msg_id": msg_id,
-                        "status": "sent",
+                    await manager.broadcast_user(username, {
+                        "type": "status_update", "msg_id": msg_id, "status": "sent"
                     })
 
                     # A duplicate retry was already persisted and must not be forwarded twice.
@@ -875,32 +982,29 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         "integrity_hash": content_sha256(content),
                         "id": get_message_row_id(msg_id),
                     }
-                    recipient_socket = manager.active_connections.get(recipient)
-                    if recipient_socket is not None:
+                    recipient_devices = manager.connections_for(recipient)
+                    if recipient_devices:
                         performance_metrics.begin_delivery(
                             msg_id, username, recipient, started_at=delivery_started_at
                         )
-                        try:
-                            await recipient_socket.send_json(incoming_frame)
-                            await websocket.send_json({"type": "status_update", "msg_id": msg_id, "status": "delivered"})
+                        delivered_devices = await manager.broadcast_user(recipient, incoming_frame)
+                        if delivered_devices:
+                            # Delivery state is shared across every sender device.
+                            await manager.broadcast_user(username, {
+                                "type": "status_update", "msg_id": msg_id, "status": "delivered"
+                            })
                             mark_messages_delivered([msg_id])
-                        except Exception:
+                        else:
                             performance_metrics.cancel_pending_delivery(msg_id, recipient)
-                            logger.exception("Live message delivery failed: recipient=%s", recipient)
-                            manager.disconnect(recipient, recipient_socket)
-                            try:
-                                await websocket.send_json({"type": "status_update", "msg_id": msg_id, "status": "sent"})
-                            except Exception:
-                                logger.debug("Could not send message status: username=%s", username, exc_info=True)
 
-                    if recipient not in manager.active_connections or not manager.visible.get(recipient, True):
+                    if not manager.connections_for(recipient) or not manager.visible.get(recipient, True):
                         try:
                             schedule_push(msg_id, username, recipient, content)
                         except Exception:
                             logger.exception("Failed to schedule push notification: recipient=%s", recipient)
 
             elif message_type == "visibility":
-                manager.visible[username] = bool(data.get("visible"))
+                manager.set_visibility(username, websocket, bool(data.get("visible")))
 
             elif message_type == "ping":
                 # Heartbeat (FR-21): lets the client detect a dead connection quickly.
@@ -913,18 +1017,12 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 completed = performance_metrics.complete_delivery_ack(msg_id.strip(), recipient=username)
                 if completed is None:
                     continue
-                sender_socket = manager.active_connections.get(completed["sender"])
-                if sender_socket is not None:
-                    try:
-                        await sender_socket.send_json({
-                            "type": "performance_metric",
-                            "msg_id": completed["message_id"],
-                            "server_delivery_latency_ms": completed["server_latency_ms"],
-                            "target_ms": performance_metrics.LATENCY_TARGET_MS,
-                        })
-                    except Exception:
-                        logger.debug("Could not send latency result to sender", exc_info=True)
-                        manager.disconnect(completed["sender"], sender_socket)
+                await manager.broadcast_user(completed["sender"], {
+                    "type": "performance_metric",
+                    "msg_id": completed["message_id"],
+                    "server_delivery_latency_ms": completed["server_latency_ms"],
+                    "target_ms": performance_metrics.LATENCY_TARGET_MS,
+                })
 
             elif message_type == "latency_report":
                 msg_id = data.get("msg_id")
@@ -938,13 +1036,19 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 if not isinstance(sender, str) or not isinstance(msg_id, str):
                     await websocket.send_json({"type": "error", "message": "Invalid read receipt."})
                     continue
-                sender_socket = manager.active_connections.get(sender)
-                if sender_socket is not None:
-                    try:
-                        await sender_socket.send_json({"type": "status_update", "msg_id": msg_id, "status": "read"})
-                    except Exception:
-                        logger.exception("Failed to send read receipt: recipient=%s", sender)
-                        manager.disconnect(sender, sender_socket)
+
+                # Persist only a read receipt from the actual message recipient.
+                if not mark_message_read(msg_id, sender, username):
+                    continue
+
+                await manager.broadcast_user(sender, {
+                    "type": "status_update", "msg_id": msg_id, "status": "read"
+                })
+                # Keep the reader's other devices in sync as well.
+                await manager.broadcast_user(username, {
+                    "type": "message_read_sync", "msg_id": msg_id,
+                    "sender": sender, "reader": username, "status": "read"
+                }, exclude=websocket)
             else:
                 await websocket.send_json({"type": "error", "message": "Unsupported message type."})
 
@@ -989,14 +1093,7 @@ async def broadcast_profile(username: str, profile: dict):
     targets = {username} | set(profile_service.contacts_of(username))
     frame = {"type": "profile_update", "profile": profile}
     for name in targets:
-        socket_ = manager.active_connections.get(name)
-        if socket_ is None:
-            continue
-        try:
-            await socket_.send_json(frame)
-        except Exception:
-            logger.exception("Profile broadcast failed for an active connection")
-            manager.disconnect(name)
+        await manager.broadcast_user(name, frame)
 
 
 @app.get("/api/profiles")

@@ -165,12 +165,89 @@ def test_blocked_error_is_not_retryable(client, tokens):
     c = main.get_db(); c.execute("DELETE FROM user_blocks"); c.commit()
 
 
-def test_new_connection_replaces_old_with_4001(client, tokens):
-    from starlette.websockets import WebSocketDisconnect
+def test_multiple_devices_for_same_user_remain_connected(client, tokens):
     with client.websocket_connect(ws_url("alice", tokens["alice"])) as first:
         with client.websocket_connect(ws_url("alice", tokens["alice"])) as second:
-            with pytest.raises(WebSocketDisconnect) as exc:
-                first.receive_json()
-            assert exc.value.code == 4001
+            first.send_json({"type": "ping"})
             second.send_json({"type": "ping"})
+            assert first.receive_json() == {"type": "pong"}
             assert second.receive_json() == {"type": "pong"}
+            assert len(main.manager.connections_for("alice")) >= 2
+
+
+def _receive_matching(websocket, message_type, msg_id=None, status=None, limit=12):
+    for _ in range(limit):
+        frame = websocket.receive_json()
+        if frame.get("type") != message_type:
+            continue
+        if msg_id is not None and frame.get("msg_id") != msg_id:
+            continue
+        if status is not None and frame.get("status") != status:
+            continue
+        return frame
+    raise AssertionError(
+        f"Did not receive {message_type} for msg_id={msg_id!r}, status={status!r}"
+    )
+
+
+def test_outgoing_message_and_delivery_state_sync_across_devices(client, tokens):
+    msg_id = "fr26-outgoing-device-sync"
+    with client.websocket_connect(ws_url("bob", tokens["bob"])) as bob_phone:
+        with client.websocket_connect(ws_url("bob", tokens["bob"])) as bob_laptop:
+            with client.websocket_connect(ws_url("alice", tokens["alice"])) as alice_phone:
+                with client.websocket_connect(ws_url("alice", tokens["alice"])) as alice_laptop:
+                    send(alice_phone, msg_id, "bob", "hello from one device")
+
+                    mirrored = _receive_matching(alice_laptop, "message_sync", msg_id)
+                    assert mirrored["sender"] == "alice"
+                    assert mirrored["recipient"] == "bob"
+                    assert mirrored["content"] == "hello from one device"
+                    assert len(mirrored["integrity_hash"]) == 64
+
+                    incoming_phone = _receive_matching(bob_phone, "receive_message", msg_id)
+                    incoming_laptop = _receive_matching(bob_laptop, "receive_message", msg_id)
+                    assert incoming_phone["content"] == incoming_laptop["content"] == "hello from one device"
+
+                    # The verified delivery ACK is accepted from any active recipient device.
+                    bob_phone.send_json({"type": "delivery_ack", "msg_id": msg_id})
+                    _receive_matching(alice_phone, "performance_metric", msg_id)
+                    _receive_matching(alice_laptop, "performance_metric", msg_id)
+
+                    # Reading on one recipient device persists the state and broadcasts it to all sender devices.
+                    bob_phone.send_json({
+                        "type": "read_ack", "msg_id": msg_id, "sender": "alice", "reader": "bob"
+                    })
+                    _receive_matching(alice_phone, "status_update", msg_id, status="read")
+                    _receive_matching(alice_laptop, "status_update", msg_id, status="read")
+                    _receive_matching(bob_laptop, "message_read_sync", msg_id, status="read")
+
+    conn = main.get_db()
+    try:
+        row = conn.execute("SELECT status FROM messages WHERE msg_id = ?", (msg_id,)).fetchone()
+        assert row is not None and row["status"] == "read"
+    finally:
+        conn.close()
+
+
+def test_read_ack_cannot_mark_another_users_message_read(client, tokens):
+    msg_id = "fr26-forged-read-ack"
+    charlie_token = _login("charlie_fr26")
+    with client.websocket_connect(ws_url("bob", tokens["bob"])) as bob:
+        with client.websocket_connect(ws_url("alice", tokens["alice"])) as alice:
+            send(alice, msg_id, "bob", "private message")
+            _receive_matching(alice, "status_update", msg_id, status="sent")
+            _receive_matching(alice, "status_update", msg_id, status="delivered")
+            _receive_matching(bob, "receive_message", msg_id)
+            # Charlie (a different authenticated account) cannot mark Alice's message as read for Bob.
+            with client.websocket_connect(ws_url("charlie_fr26", charlie_token)) as charlie:
+                charlie.send_json({"type": "read_ack", "msg_id": msg_id, "sender": "alice", "reader": "bob"})
+                charlie.send_json({"type": "ping"})
+                assert charlie.receive_json() == {"type": "pong"}
+
+    conn = main.get_db()
+    try:
+        row = conn.execute("SELECT status FROM messages WHERE msg_id = ?", (msg_id,)).fetchone()
+        assert row is not None and row["status"] == "delivered"
+    finally:
+        conn.close()
+
