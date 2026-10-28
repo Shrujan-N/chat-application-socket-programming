@@ -1976,18 +1976,23 @@
         let incomingIntegrityChain = Promise.resolve();
 
         function handleIncomingSignal(data) {
-            if (data.type !== "receive_message") {
+            const orderedDeviceEvents = ["receive_message", "message_sync", "status_update", "message_read_sync"];
+            if (!orderedDeviceEvents.includes(data.type)) {
                 return handleIncomingSignalVerified(data);
             }
 
             incomingIntegrityChain = incomingIntegrityChain.then(async () => {
-                const validHash = typeof data.integrity_hash === 'string'
-                    && await hashMessageContent(data.content) === data.integrity_hash;
-                if (!validHash) {
-                    console.error('Rejected incoming message with invalid integrity checksum:', data.msg_id);
-                    showToast('A message failed integrity verification and was not displayed.');
-                    return;
+                if (data.type === "receive_message" || data.type === "message_sync") {
+                    const validHash = typeof data.integrity_hash === 'string'
+                        && await hashMessageContent(data.content) === data.integrity_hash;
+                    if (!validHash) {
+                        console.error('Rejected incoming message with invalid integrity checksum:', data.msg_id);
+                        showToast('A message failed integrity verification and was not displayed.');
+                        return;
+                    }
                 }
+                // Keep subsequent status frames behind message_sync so a fast delivery
+                // acknowledgement cannot race ahead of rendering the mirrored message.
                 handleIncomingSignalVerified(data);
             }).catch(error => {
                 console.error('Could not verify incoming message integrity:', error);
@@ -2002,6 +2007,16 @@
                 return;
             }
             if (data.type === "pong") return;     // heartbeat reply (FR-21)
+            if (data.type === "message_sync") {
+                // Outgoing message created on another logged-in device for this account.
+                if (data.sender !== currentUser || !data.msg_id) return;
+                noteSeenId(data.id);
+                rememberLiveId(data.msg_id);
+                if (activeContact === data.recipient) {
+                    appendMessageUI(currentUser, data.content, data.timestamp, data.status || 'sent', data.msg_id);
+                }
+                return;
+            }
             if (data.type === "receive_message") {
                 noteSeenId(data.id);
                 rememberLiveId(data.msg_id);
@@ -2069,6 +2084,10 @@
                         statusElem.title = 'Read';
                     }
                 }
+            }
+            // A different device for this account marked a message read.
+            else if (data.type === "message_read_sync") {
+                if (activeContact === data.sender) loadHistory();
             }
             // A contact (or I, from another tab) changed a profile (FR-05)
             else if (data.type === "profile_update" && data.profile) {
