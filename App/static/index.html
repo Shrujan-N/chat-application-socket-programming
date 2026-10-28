@@ -19,6 +19,19 @@
         .message.received { background: #202c33; align-self: flex-start; margin-right: auto; border-bottom-left-radius: 0; }
         .message-status { font-size: 11px; margin-left: 6px; float: right; color: #8696a0; }
         .message-status.read { color: #53bdeb; }
+        .message-reply-quote { display:block; width:100%; min-width:0; margin:0 0 7px; padding:6px 8px; text-align:left; color:inherit; background:rgba(0,0,0,.18); border:0; border-left:3px solid #53bdeb; border-radius:4px; cursor:pointer; }
+        .message-reply-quote strong { display:block; font-size:11px; color:#8fd3f4; margin-bottom:2px; }
+        .message-reply-quote span { display:block; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:12px; opacity:.9; }
+        .message-action-row { display:flex; justify-content:flex-end; margin-top:4px; }
+        .message-reply-btn { padding:2px 8px; font-size:11px; min-height:0; background:rgba(255,255,255,.08); color:#dbeafe; border:1px solid rgba(255,255,255,.12); border-radius:5px; cursor:pointer; }
+        .message-reply-btn:hover { background:rgba(83,189,235,.18); }
+        .message.reply-highlight { outline:2px solid #53bdeb; box-shadow:0 0 0 4px rgba(83,189,235,.16); }
+        #reply-composer-preview { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:0 10px 8px; padding:7px 10px; border-left:3px solid #53bdeb; border-radius:6px; background:#1c2939; color:#e5edf7; }
+        #reply-composer-preview[hidden] { display:none; }
+        #reply-composer-content { display:flex; flex:1; flex-direction:column; min-width:0; gap:2px; }
+        #reply-composer-title { font-size:12px; color:#8fd3f4; }
+        #reply-composer-text { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:12px; }
+        #reply-composer-cancel { min-height:0; padding:3px 8px; background:#374151; font-size:12px; }
         #input-area { padding: 15px; background: #1a2332; border-top: 1px solid #2e3b52; display: flex; gap: 10px; align-items: center; }
         #voice-record-button { flex: none; padding: 10px 12px; background: #596579; }
         #voice-record-button:hover { background: #465166; }
@@ -371,6 +384,13 @@
     </div>
     <div class="header" id="chat-header">Select a contact to begin messaging</div>
         <div id="messages-list"></div>
+        <div id="reply-composer-preview" hidden aria-live="polite">
+            <div id="reply-composer-content">
+                <strong id="reply-composer-title"></strong>
+                <span id="reply-composer-text"></span>
+            </div>
+            <button type="button" id="reply-composer-cancel" onclick="cancelReply()" aria-label="Cancel reply">Cancel</button>
+        </div>
         <div id="input-area">
             <input type="file" id="file-input" style="display:none;" onchange="uploadFile()">
             <button type="button" onclick="document.getElementById('file-input').click()" title="Attach a file" aria-label="Attach a file">&#128206;</button>
@@ -458,6 +478,8 @@
         let currentUser = null;
         let activeContact = null;
         let ws = null;
+        let replyingTo = null;
+        const renderedMessages = new Map();
         let reconnectTimer = null;
         let reconnectDelay = 1000;
         const OUTBOX_PREFIX = 'chat_outbox:';
@@ -567,7 +589,8 @@
                     recipient: message.recipient,
                     content: message.content,
                     timestamp: message.timestamp,
-                    integrity_hash: message.integrity_hash
+                    integrity_hash: message.integrity_hash,
+                    reply_to_msg_id: message.reply_to_msg_id || null
                 }));
                 setMessageStatus(message.msg_id, '…', isRetry ? 'Retrying; waiting for server status' : 'Waiting for server status');
                 return true;
@@ -759,6 +782,13 @@
         // ---------- sending while the link may be down ----------
         // Queue in the outbox first (survives refresh), then transmit if connected.
         function dispatchQueuedMessage(payload) {
+            if (!payload.reply_to_msg_id && replyingTo && payload.recipient === activeContact) {
+                const reply = { ...replyingTo };
+                payload.reply_to_msg_id = reply.msg_id;
+                payload.reply_preview = reply;
+                updateRenderedReplyPreview(payload.msg_id, reply);
+                cancelReply();
+            }
             queueOutgoingMessage(payload);
             if (wsOpen()) {
                 if (transmitQueuedMessage(payload)) {
@@ -1923,6 +1953,7 @@
         }
 
         function selectContact(contact) {
+            if (activeContact !== contact) cancelReply();
             activeContact = contact;
             if (window.matchMedia && window.matchMedia('(max-width: 700px)').matches) {
                 document.body.classList.add('mobile-chat-open');
@@ -1956,14 +1987,14 @@
 
                 (data.history || []).forEach(msg => {
                     if (msg.msg_id) knownIds.add(msg.msg_id);
-                    appendMessageUI(msg.sender, msg.content, msg.timestamp, msg.status, msg.msg_id);
+                    appendMessageUI(msg.sender, msg.content, msg.timestamp, msg.status, msg.msg_id, msg.reply_preview);
                 });
 
                 // Keep queued messages visible after refresh until the server acknowledges them.
                 readOutbox()
                     .filter(msg => msg.recipient === contactAtRequest && !knownIds.has(msg.msg_id))
                     .forEach(msg => {
-                        appendMessageUI(currentUser, msg.content, msg.timestamp, 'sending', msg.msg_id);
+                        appendMessageUI(currentUser, msg.content, msg.timestamp, 'sending', msg.msg_id, msg.reply_preview);
                         setMessageStatus(msg.msg_id, '…', 'Queued; waiting for server confirmation');
                     });
             } catch (error) {
@@ -2029,7 +2060,7 @@
                     }
                 }
                 if (activeContact === data.sender) {
-                    appendMessageUI(data.sender, data.content, data.timestamp, 'delivered', data.msg_id);
+                    appendMessageUI(data.sender, data.content, data.timestamp, 'delivered', data.msg_id, data.reply_preview);
                     
                     // Send Read Receipt ACK back to sender (ADDED FOR ISSUE #22)
                     ws.send(JSON.stringify({
@@ -2197,13 +2228,16 @@
             const msgId = 'msg-' + (window.crypto && crypto.randomUUID
                 ? crypto.randomUUID()
                 : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+            const reply = replyingTo ? { ...replyingTo } : null;
             const payload = {
                 type: 'send_message',
                 msg_id: msgId,
                 sender: currentUser,
                 recipient: activeContact,
                 content: content,
-                timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                reply_to_msg_id: reply ? reply.msg_id : null,
+                reply_preview: reply
             };
             input.value = '';
 
@@ -2212,7 +2246,8 @@
                 if (payload.sender !== currentUser) return;
                 payload.integrity_hash = await hashMessageContent(payload.content);
                 queueOutgoingMessage(payload);
-                appendMessageUI(currentUser, content, payload.timestamp, 'sending', msgId);
+                appendMessageUI(currentUser, content, payload.timestamp, 'sending', msgId, reply);
+                if (replyingTo && reply && replyingTo.msg_id === reply.msg_id) cancelReply();
                 setMessageStatus(msgId, '…', 'Waiting for server integrity verification and save');
 
                 if (wsOpen()) {
@@ -2236,9 +2271,84 @@
             });
         }
 
-        function appendMessageUI(sender, content, timeStr, status, msgId) {
+        function replyContentText(content) {
+            const scratch = document.createElement('div');
+            scratch.innerHTML = String(content == null ? '' : content);
+            return (scratch.textContent || scratch.innerText || '').replace(/\s+/g, ' ').trim() || '[Attachment]';
+        }
+
+        function createReplyQuote(replyPreview) {
+            if (!replyPreview || !replyPreview.msg_id) return null;
+            const quote = document.createElement('button');
+            quote.type = 'button';
+            quote.className = 'message-reply-quote';
+            quote.title = 'Jump to original message';
+            const author = document.createElement('strong');
+            author.textContent = `↪ ${replyPreview.sender || 'Message'}`;
+            const previewText = document.createElement('span');
+            previewText.textContent = replyContentText(replyPreview.content).slice(0, 180);
+            quote.append(author, previewText);
+            quote.addEventListener('click', () => jumpToMessage(replyPreview.msg_id));
+            return quote;
+        }
+
+        function updateRenderedReplyPreview(msgId, replyPreview) {
+            const metadata = renderedMessages.get(msgId);
+            if (metadata) metadata.reply_preview = replyPreview || null;
+            const messageElement = document.getElementById(`msg-${msgId}`);
+            const body = messageElement && messageElement.firstElementChild;
+            if (!body) return;
+            const previousQuote = body.querySelector('.message-reply-quote');
+            if (previousQuote) previousQuote.remove();
+            const quote = createReplyQuote(replyPreview);
+            if (quote) body.insertBefore(quote, body.firstChild);
+        }
+
+        function startReplyToMessage(msgId) {
+            const message = renderedMessages.get(msgId);
+            if (!message || !activeContact) return;
+            replyingTo = {
+                msg_id: message.msg_id,
+                sender: message.sender,
+                content: message.content,
+                timestamp: message.timestamp
+            };
+            document.getElementById('reply-composer-title').textContent = `Replying to ${message.sender}`;
+            document.getElementById('reply-composer-text').textContent = replyContentText(message.content).slice(0, 180);
+            document.getElementById('reply-composer-preview').hidden = false;
+            document.getElementById('message-input').focus();
+        }
+
+        function cancelReply() {
+            replyingTo = null;
+            const bar = document.getElementById('reply-composer-preview');
+            if (bar) bar.hidden = true;
+            const title = document.getElementById('reply-composer-title');
+            const text = document.getElementById('reply-composer-text');
+            if (title) title.textContent = '';
+            if (text) text.textContent = '';
+        }
+
+        function jumpToMessage(msgId) {
+            const target = document.getElementById(`msg-${msgId}`);
+            if (!target) {
+                showToast('Original message is not currently in this conversation.');
+                return;
+            }
+            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            target.classList.add('reply-highlight');
+            window.setTimeout(() => target.classList.remove('reply-highlight'), 1800);
+        }
+
+        function appendMessageUI(sender, content, timeStr, status, msgId, replyPreview = null) {
             const list = document.getElementById('messages-list');
             if (msgId && document.getElementById(`msg-${msgId}`)) return;
+            if (msgId) {
+                renderedMessages.set(msgId, {
+                    msg_id: msgId, sender, content, timestamp: timeStr, status,
+                    reply_preview: replyPreview || null
+                });
+            }
             const msgDiv = document.createElement('div');
             const isSent = (sender === currentUser);
             msgDiv.className = `message ${isSent ? 'sent' : 'received'}`;
@@ -2261,8 +2371,35 @@
                 const readClass = status === 'read' ? ' read' : '';
                 statusHTML = `<span class="message-status${readClass}" id="status-${msgId}" title="${title}">${label}</span>`;
             }
-            msgDiv.innerHTML = `<div>${content}</div><div style="font-size:10px; opacity:0.7; text-align:right;">${timeStr} ${statusHTML}</div>`;
-            
+            const body = document.createElement('div');
+            const quote = createReplyQuote(replyPreview);
+            if (quote) body.appendChild(quote);
+            const contentElement = document.createElement('div');
+            contentElement.innerHTML = content;
+            body.appendChild(contentElement);
+            msgDiv.appendChild(body);
+
+            const footer = document.createElement('div');
+            footer.style.cssText = 'font-size:10px; opacity:0.7; text-align:right;';
+            footer.innerHTML = `${timeStr} ${statusHTML}`;
+            msgDiv.appendChild(footer);
+
+            if (msgId) {
+                const actionRow = document.createElement('div');
+                actionRow.className = 'message-action-row';
+                const replyButton = document.createElement('button');
+                replyButton.type = 'button';
+                replyButton.className = 'message-reply-btn';
+                replyButton.textContent = '↩ Reply';
+                replyButton.setAttribute('aria-label', `Reply to message from ${sender}`);
+                replyButton.addEventListener('click', event => {
+                    event.stopPropagation();
+                    startReplyToMessage(msgId);
+                });
+                actionRow.appendChild(replyButton);
+                msgDiv.appendChild(actionRow);
+            }
+
             list.appendChild(msgDiv);
             list.scrollTop = list.scrollHeight;
         }
