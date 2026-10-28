@@ -700,6 +700,37 @@ def assert_message_integrity(rows) -> None:
             )
 
 
+
+def get_message_reply_preview(reply_to_msg_id: Optional[str], sender: str, recipient: str):
+    """Return a safe, integrity-checked preview only for a message in this conversation."""
+    if not reply_to_msg_id:
+        return None
+    conn = None
+    try:
+        conn = get_db()
+        row = conn.execute(
+            """SELECT msg_id, sender, recipient, content, timestamp, status, integrity_hash
+               FROM messages
+               WHERE msg_id = ? AND (
+                   (sender = ? AND recipient = ?) OR
+                   (sender = ? AND recipient = ?)
+               )""",
+            (reply_to_msg_id, sender, recipient, recipient, sender),
+        ).fetchone()
+    finally:
+        if conn is not None:
+            conn.close()
+    if row is None:
+        return None
+    assert_message_integrity([row])
+    return {
+        "msg_id": row["msg_id"],
+        "sender": row["sender"],
+        "content": row["content"],
+        "timestamp": row["timestamp"],
+    }
+
+
 def persist_websocket_message(
     msg_id: str,
     sender: str,
@@ -707,6 +738,7 @@ def persist_websocket_message(
     content: str,
     timestamp: str,
     integrity_hash: Optional[str] = None,
+    reply_to_msg_id: Optional[str] = None,
 ):
     """Persist a message once; identical retries are safe and idempotent."""
     expected_hash = content_sha256(content)
@@ -720,17 +752,17 @@ def persist_websocket_message(
         cursor = conn.execute(
             """
             INSERT OR IGNORE INTO messages
-                (msg_id, sender, recipient, content, timestamp, status, integrity_hash)
-            VALUES (?, ?, ?, ?, ?, 'sent', ?)
+                (msg_id, sender, recipient, content, timestamp, status, integrity_hash, reply_to_msg_id)
+            VALUES (?, ?, ?, ?, ?, 'sent', ?, ?)
             """,
-            (msg_id, sender, recipient, content, timestamp, integrity_hash),
+            (msg_id, sender, recipient, content, timestamp, integrity_hash, reply_to_msg_id),
         )
         inserted = cursor.rowcount == 1
 
         if not inserted:
             existing = conn.execute(
                 """
-                SELECT sender, recipient, content, timestamp, integrity_hash
+                SELECT sender, recipient, content, timestamp, integrity_hash, reply_to_msg_id
                 FROM messages
                 WHERE msg_id = ?
                 """,
@@ -741,6 +773,7 @@ def persist_websocket_message(
                 or existing["recipient"] != recipient
                 or existing["content"] != content
                 or existing["timestamp"] != timestamp
+                or existing["reply_to_msg_id"] != reply_to_msg_id
                 or not verify_content_sha256(existing["content"], existing["integrity_hash"])
             ):
                 raise ValueError("Message ID conflicts with an existing message")
@@ -890,6 +923,24 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 recipient = recipient.strip()
                 msg_id = msg_id.strip()
 
+                reply_to_msg_id = data.get("reply_to_msg_id")
+                reply_preview = None
+                if reply_to_msg_id is not None:
+                    if not isinstance(reply_to_msg_id, str) or not reply_to_msg_id.strip():
+                        await websocket.send_json({
+                            "type": "error", "msg_id": msg_id,
+                            "message": "Invalid reply reference. Please select a message in this chat.",
+                        })
+                        continue
+                    reply_to_msg_id = reply_to_msg_id.strip()
+                    reply_preview = get_message_reply_preview(reply_to_msg_id, username, recipient)
+                    if reply_preview is None:
+                        await websocket.send_json({
+                            "type": "error", "msg_id": msg_id,
+                            "message": "The message you are replying to was not found in this conversation.",
+                        })
+                        continue
+
                 # DATA_INTEGRITY_ISSUE_45: reject content changed after the client hashed it.
                 provided_integrity_hash = data.get("integrity_hash")
                 if provided_integrity_hash is not None and not verify_content_sha256(
@@ -922,7 +973,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 async with get_recipient_delivery_lock(recipient):
                     try:
                         inserted = persist_websocket_message(
-                            msg_id, username, recipient, content, timestamp, provided_integrity_hash
+                            msg_id, username, recipient, content, timestamp, provided_integrity_hash, reply_to_msg_id
                         )
                     except ValueError:
                         await websocket.send_json({
@@ -981,6 +1032,8 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         "recipient": recipient, "content": content, "timestamp": timestamp,
                         "integrity_hash": content_sha256(content),
                         "id": get_message_row_id(msg_id),
+                        "reply_to_msg_id": reply_to_msg_id,
+                        "reply_preview": reply_preview,
                     }
                     recipient_devices = manager.connections_for(recipient)
                     if recipient_devices:
@@ -1484,7 +1537,7 @@ async def get_chat_history(user1: str, user2: str):
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT msg_id, sender, recipient, content, timestamp, status, integrity_hash 
+        SELECT msg_id, sender, recipient, content, timestamp, status, integrity_hash, reply_to_msg_id 
         FROM messages 
         WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)
         ORDER BY rowid ASC
@@ -1496,6 +1549,9 @@ async def get_chat_history(user1: str, user2: str):
     for row in rows:
         item = dict(row)
         item.pop("integrity_hash", None)
+        item["reply_preview"] = get_message_reply_preview(
+            item.get("reply_to_msg_id"), item["sender"], item["recipient"]
+        )
         history.append(item)
     return {"history": history}
 
@@ -1525,7 +1581,7 @@ async def sync_missed_messages(request: Request, since: int = -1):
 
         rows = conn.execute(
             """
-            SELECT rowid AS id, msg_id, sender, recipient, content, timestamp, status, integrity_hash
+            SELECT rowid AS id, msg_id, sender, recipient, content, timestamp, status, integrity_hash, reply_to_msg_id
             FROM messages
             WHERE recipient = ? AND rowid > ?
             ORDER BY rowid ASC
@@ -1537,6 +1593,9 @@ async def sync_missed_messages(request: Request, since: int = -1):
         messages = [dict(row) for row in rows]
         for message in messages:
             message.pop("integrity_hash", None)
+            message["reply_preview"] = get_message_reply_preview(
+                message.get("reply_to_msg_id"), message["sender"], message["recipient"]
+            )
 
         newly_delivered = [m for m in messages if m["status"] == "sent"]
         if newly_delivered:
