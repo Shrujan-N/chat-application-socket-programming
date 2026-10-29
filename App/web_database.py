@@ -6,13 +6,16 @@ from pathlib import Path
 DB_PATH = Path(os.environ.get("CHAT_WEB_DB_PATH", os.environ.get("CHAT_DB_PATH", Path(__file__).resolve().parent / "chat_app.db"))).resolve()
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
 def init_db():
     with get_db() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript('''
         CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY, email TEXT UNIQUE, password TEXT);
         CREATE TABLE IF NOT EXISTS contacts(
@@ -146,6 +149,12 @@ def init_db():
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_type,conversation_id,timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to_msg_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_status ON messages(recipient,status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender_recipient ON messages(sender,recipient)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_group_id ON messages(conversation_type,group_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_group_members_username ON group_members(username,group_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_user_status ON contacts(user_id,status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_contact_status ON contacts(contact_id,status)")
         for username, email in [
           ("shrujan","shrujan@example.com"),
           ("testuser01","user01@example.com"),

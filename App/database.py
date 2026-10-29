@@ -16,13 +16,16 @@ DB_PATH = Path(
 
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
  
 def init_db() -> None:
     conn = get_db()
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     cursor = conn.cursor()
  
     cursor.execute("""
@@ -131,6 +134,11 @@ def init_db() -> None:
     );
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(username)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_contacts_user_status ON contacts(user_id, status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_contacts_contact_status ON contacts(contact_id, status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_status ON messages(recipient, status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender_recipient ON messages(sender, recipient)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_revoked_sessions_expires ON revoked_sessions(expires_at)")
 
     # Muted chats/contacts: no push notification for messages from `muted_user`.
     cursor.execute("""
