@@ -139,6 +139,20 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_reactions_msg ON message_reactions(msg_id);
         CREATE INDEX IF NOT EXISTS idx_reactions_msg_user ON message_reactions(msg_id, username);
+        CREATE TABLE IF NOT EXISTS call_records (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          call_id TEXT UNIQUE NOT NULL,
+          caller TEXT NOT NULL,
+          recipient TEXT,
+          group_id TEXT,
+          media_type TEXT NOT NULL DEFAULT 'voice',
+          status TEXT NOT NULL DEFAULT 'missed',
+          started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          ended_at TEXT,
+          duration_seconds INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_call_records_user ON call_records(caller, recipient);
+        CREATE INDEX IF NOT EXISTS idx_call_records_group ON call_records(group_id);
 
         ''')
         columns = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}

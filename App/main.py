@@ -128,6 +128,7 @@ from reactions_service import (
     get_reactions_for_messages,
     toggle_message_reaction,
 )
+import call_service
 
 BASE = Path(__file__).resolve().parent
 STATIC = BASE / "static"
@@ -1524,6 +1525,158 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     await manager.broadcast_user(msg_row["sender"], broadcast_data)
                     if msg_row["recipient"] and msg_row["recipient"] != msg_row["sender"]:
                         await manager.broadcast_user(msg_row["recipient"], broadcast_data)
+            elif message_type == "call_offer":
+                call_id = data.get("call_id") or os.urandom(12).hex()
+                recipient = data.get("recipient")
+                group_id = data.get("group_id")
+                media_type = data.get("media_type") or "voice"
+                sdp = data.get("sdp")
+
+                conn = get_db()
+                try:
+                    if group_id:
+                        membership = conn.execute(
+                            "SELECT 1 FROM group_members WHERE group_id = ? AND username = ?",
+                            (group_id, username)
+                        ).fetchone()
+                        if not membership:
+                            await websocket.send_json({"type": "error", "message": "Not a group member."})
+                            continue
+                        members = [
+                            r["username"] for r in conn.execute(
+                                "SELECT username FROM group_members WHERE group_id = ? AND username != ?",
+                                (group_id, username)
+                            ).fetchall()
+                        ]
+                        call_service.create_call(conn, call_id, username, None, group_id, media_type)
+                        offer_frame = {
+                            "type": "call_offer",
+                            "call_id": call_id,
+                            "caller": username,
+                            "group_id": group_id,
+                            "media_type": media_type,
+                            "sdp": sdp,
+                        }
+                        await manager.broadcast_many_users(members, offer_frame)
+                        await websocket.send_json({
+                            "type": "call_ringing",
+                            "call_id": call_id,
+                            "group_id": group_id,
+                            "media_type": media_type
+                        })
+                    elif recipient:
+                        if recipient == username:
+                            await websocket.send_json({"type": "error", "message": "Cannot call yourself."})
+                            continue
+                        # Check block
+                        blocked = conn.execute(
+                            "SELECT 1 FROM user_blocks WHERE blocker_username = ? AND blocked_username = ?",
+                            (recipient, username)
+                        ).fetchone()
+                        if blocked:
+                            await websocket.send_json({"type": "error", "message": "User is unavailable."})
+                            continue
+                        call_service.create_call(conn, call_id, username, recipient, None, media_type)
+                        offer_frame = {
+                            "type": "call_offer",
+                            "call_id": call_id,
+                            "caller": username,
+                            "recipient": recipient,
+                            "media_type": media_type,
+                            "sdp": sdp,
+                        }
+                        await manager.broadcast_user(recipient, offer_frame)
+                        await websocket.send_json({
+                            "type": "call_ringing",
+                            "call_id": call_id,
+                            "recipient": recipient,
+                            "media_type": media_type
+                        })
+                    else:
+                        await websocket.send_json({"type": "error", "message": "Recipient or group_id required."})
+                finally:
+                    conn.close()
+
+            elif message_type == "call_answer":
+                call_id = data.get("call_id")
+                sdp = data.get("sdp")
+                session = call_service.get_active_call(call_id)
+                if not session:
+                    await websocket.send_json({"type": "error", "message": "Call not found."})
+                    continue
+                conn = get_db()
+                try:
+                    call_service.accept_call(conn, call_id, username)
+                finally:
+                    conn.close()
+                delivered = await manager.broadcast_user(session.caller, {
+                    "type": "call_answer",
+                    "call_id": call_id,
+                    "answerer": username,
+                    "sdp": sdp,
+                })
+
+            elif message_type == "ice_candidate":
+                call_id = data.get("call_id")
+                candidate = data.get("candidate")
+                target = data.get("target")
+                session = call_service.get_active_call(call_id)
+                if session and not target:
+                    target = session.recipient if username == session.caller else session.caller
+                if target:
+                    await manager.broadcast_user(target, {
+                        "type": "ice_candidate",
+                        "call_id": call_id,
+                        "sender": username,
+                        "candidate": candidate,
+                    })
+
+            elif message_type == "call_reject":
+                call_id = data.get("call_id")
+                reason = data.get("reason") or "declined"
+                session = call_service.get_active_call(call_id)
+                conn = get_db()
+                try:
+                    call_service.end_call(conn, call_id, status="declined")
+                finally:
+                    conn.close()
+                if session and session.caller != username:
+                    await manager.broadcast_user(session.caller, {
+                        "type": "call_rejected",
+                        "call_id": call_id,
+                        "by": username,
+                        "reason": reason,
+                    })
+
+            elif message_type == "call_end":
+                call_id = data.get("call_id")
+                session = call_service.get_active_call(call_id)
+                conn = get_db()
+                try:
+                    call_service.end_call(conn, call_id, status="completed")
+                    if session and session.group_id:
+                        members = [
+                            r["username"] for r in conn.execute(
+                                "SELECT username FROM group_members WHERE group_id = ?",
+                                (session.group_id,)
+                            ).fetchall()
+                        ]
+                        targets = set(members)
+                    elif session:
+                        targets = set(session.participants) | ({session.recipient} if session.recipient else set())
+                    else:
+                        targets = set()
+                finally:
+                    conn.close()
+
+                targets.discard(username)
+                for t in targets:
+                    if t:
+                        await manager.broadcast_user(t, {
+                            "type": "call_ended",
+                            "call_id": call_id,
+                            "by": username,
+                        })
             else:
                 await websocket.send_json({"type": "error", "message": "Unsupported message type."})
 
@@ -1635,6 +1788,27 @@ async def get_message_reactions_endpoint(msg_id: str, request: Request):
         return {"msg_id": msg_id, "reactions": reactions}
     finally:
         conn.close()
+
+
+# --- Voice / Video Calls Endpoints (Issue #39, FR-28) ---
+@app.get("/api/calls/history")
+async def get_calls_history_endpoint(request: Request):
+    username = current_username(request)
+    conn = get_db()
+    try:
+        calls = call_service.get_call_history(conn, username)
+        return {"calls": calls}
+    finally:
+        conn.close()
+
+
+@app.get("/api/calls/active")
+async def get_active_calls_endpoint(request: Request):
+    username = current_username(request)
+    for call in call_service._active_calls.values():
+        if username in call.participants or username == call.recipient:
+            return {"active_call": call.to_dict()}
+    return {"active_call": None}
 
 
 # --- End-to-End Encryption Public Key Directory (NFR-04, Issue #44) ---
