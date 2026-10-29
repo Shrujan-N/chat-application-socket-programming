@@ -311,6 +311,8 @@ def set_muted(username: str, other, muted: bool) -> list:
 def make_preview(content) -> str:
     """Plain-text preview for the notification body (never HTML)."""
     text = content if isinstance(content, str) else ""
+    if text.startswith("e2e:dh:") or text.startswith("e2e:aes:"):
+        return "🔒 New encrypted message"
 
     if "<img" in text.lower():
         return "📷 Photo"
