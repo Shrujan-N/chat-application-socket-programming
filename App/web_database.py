@@ -128,6 +128,17 @@ def init_db():
           public_key TEXT NOT NULL,
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS message_reactions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          msg_id TEXT NOT NULL,
+          username TEXT NOT NULL,
+          emoji TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(msg_id, username, emoji),
+          FOREIGN KEY(msg_id) REFERENCES messages(msg_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_reactions_msg ON message_reactions(msg_id);
+        CREATE INDEX IF NOT EXISTS idx_reactions_msg_user ON message_reactions(msg_id, username);
 
         ''')
         columns = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
