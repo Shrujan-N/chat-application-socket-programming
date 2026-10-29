@@ -529,6 +529,7 @@
         <img id="modal-img" src="" onclick="event.stopPropagation()" style="max-width:90vw; max-height:90vh; border-radius:8px; box-shadow:0 0 30px rgba(0,0,0,0.95); object-fit:contain; cursor:default;">
     </div>
  
+    <script src="/static/e2e.js"></script>
     <script>
         let currentUser = null;
         let activeContact = null;
@@ -654,6 +655,7 @@
                     content: message.content,
                     timestamp: message.timestamp,
                     integrity_hash: message.integrity_hash,
+                    mentioned_users: isGroupMessage ? (message.mentioned_users || undefined) : undefined,
                     reply_to_msg_id: isGroupMessage ? null : (message.reply_to_msg_id || null)
                 }));
                 setMessageStatus(message.msg_id, '…', isRetry ? 'Retrying; waiting for server status' : 'Waiting for server status');
@@ -1274,6 +1276,7 @@
             document.getElementById('messages-list').innerHTML = '';
             lastActivity = Date.now();
             resetConnectionState();
+            if (window.E2E) E2E.init(currentUser);
             loadLastSeenId();
             initWebSocket();
             loadPendingMentionNotifications();
@@ -1292,6 +1295,7 @@
             }
             dropSocket();
             resetConnectionState();
+            if (window.E2E) E2E.resetSession();
             authToken = null;
             currentUser = null;
             activeContact = null;
@@ -1670,7 +1674,7 @@
             if (activeGroup) {
                 const icon = activeGroup.icon || '👥';
                 const count = activeGroup.member_count || (activeGroup.members || []).length || 0;
-                header.textContent = `${icon} ${activeGroup.name} · ${count} members`;
+                header.textContent = `${icon} ${activeGroup.name} · ${count} members · 🔒 E2E`;
                 return;
             }
             if (!activeContact) {
@@ -1682,6 +1686,7 @@
             if (profile.display_name !== activeContact) text += ` (@${activeContact})`;
             if (profile.bio) text += ` - ${profile.bio}`;
             if (mutedUsers.has(activeContact)) text += ' 🔕 (muted)';
+            text += ' · 🔒 E2E';
             header.innerText = text;
         }
 
@@ -2459,22 +2464,35 @@
                 const data = await response.json();
                 if (activeContact !== contactAtRequest || activeGroupId !== groupIdAtRequest) return;
 
+                const decryptedHistory = [];
+                for (const rawMsg of (data.history || [])) {
+                    const copy = { ...rawMsg };
+                    if (window.E2E) {
+                        await E2E.decryptMessageObject(copy, currentUser, groupIdAtRequest);
+                    }
+                    decryptedHistory.push(copy);
+                }
+                if (activeContact !== contactAtRequest || activeGroupId !== groupIdAtRequest) return;
+
                 const list = document.getElementById('messages-list');
                 list.innerHTML = '';
                 const knownIds = new Set();
 
-                (data.history || []).forEach(msg => {
+                decryptedHistory.forEach(msg => {
                     if (msg.msg_id) knownIds.add(msg.msg_id);
                     appendMessageUI(msg.sender, msg.content, msg.timestamp, msg.status, msg.msg_id, msg.reply_preview, msg.mentioned_users || []);
                 });
 
                 // Keep queued messages visible after refresh until the server acknowledges them.
-                readOutbox()
-                    .filter(msg => (groupIdAtRequest ? msg.group_id === groupIdAtRequest : (!msg.group_id && msg.recipient === contactAtRequest)) && !knownIds.has(msg.msg_id))
-                    .forEach(msg => {
-                        appendMessageUI(currentUser, msg.content, msg.timestamp, 'sending', msg.msg_id, msg.reply_preview, groupIdAtRequest ? getMentionedGroupMembers(msg.content) : []);
-                        setMessageStatus(msg.msg_id, '…', 'Queued; waiting for server confirmation');
-                    });
+                const pendingOutbox = readOutbox()
+                    .filter(msg => (groupIdAtRequest ? msg.group_id === groupIdAtRequest : (!msg.group_id && msg.recipient === contactAtRequest)) && !knownIds.has(msg.msg_id));
+                for (const msg of pendingOutbox) {
+                    const shownContent = msg.plain_content !== undefined
+                        ? msg.plain_content
+                        : (window.E2E ? await E2E.decryptText(msg.content, contactAtRequest, groupIdAtRequest) : msg.content);
+                    appendMessageUI(currentUser, shownContent, msg.timestamp, 'sending', msg.msg_id, msg.reply_preview, groupIdAtRequest ? (msg.mentioned_users || getMentionedGroupMembers(shownContent)) : []);
+                    setMessageStatus(msg.msg_id, '…', 'Queued; waiting for server confirmation');
+                }
             } catch (error) {
                 console.error('Could not load conversation history:', error);
             }
@@ -2498,6 +2516,9 @@
                         console.error('Rejected incoming message with invalid integrity checksum:', data.msg_id);
                         showToast('A message failed integrity verification and was not displayed.');
                         return;
+                    }
+                    if (window.E2E) {
+                        await E2E.decryptMessageObject(data, currentUser, data.group_id || null);
                     }
                 }
                 // Keep subsequent status frames behind message_sync so a fast delivery
@@ -2738,10 +2759,16 @@
             integritySendChain = integritySendChain.then(async () => {
                 // Do not send a message from an account that was logged out while hashing.
                 if (payload.sender !== currentUser) return;
+                const mentionedForGroup = groupIdAtSend ? getMentionedGroupMembers(content) : [];
+                payload.plain_content = content;
+                if (groupIdAtSend) payload.mentioned_users = mentionedForGroup;
+                if (window.E2E) {
+                    payload.content = await E2E.encryptText(content, payload.recipient, groupIdAtSend);
+                }
                 payload.integrity_hash = await hashMessageContent(payload.content);
                 queueOutgoingMessage(payload);
                 hideMentionSuggestions();
-                appendMessageUI(currentUser, content, payload.timestamp, 'sending', msgId, reply, groupIdAtSend ? getMentionedGroupMembers(content) : []);
+                appendMessageUI(currentUser, content, payload.timestamp, 'sending', msgId, reply, mentionedForGroup);
                 if (replyingTo && reply && replyingTo.msg_id === reply.msg_id) cancelReply();
                 setMessageStatus(msgId, '…', 'Waiting for server integrity verification and save');
 
@@ -3049,12 +3076,12 @@
             }
         }
 
-        function sendGiphyMessage(mediaUrl, title) {
-            if (!activeContact) {
+        async function sendGiphyMessage(mediaUrl, title) {
+            if (!activeContact && !activeGroupId) {
                 alert('Please select a contact before sending a GIF or sticker.');
                 return;
             }
-            if (blockedUsers.has(activeContact)) {
+            if (activeContact && blockedUsers.has(activeContact)) {
                 alert(`You have blocked @${activeContact}. Unblock them before sending a GIF or sticker.`);
                 return;
             }
@@ -3070,13 +3097,18 @@
                 ? crypto.randomUUID()
                 : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
             const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const encryptedContent = window.E2E
+                ? await E2E.encryptText(content, activeGroupId ? null : activeContact, activeGroupId)
+                : content;
             const payload = {
                 type: activeGroupId ? 'send_group_message' : 'send_message',
                 msg_id: msgId,
                 sender: currentUser,
                 recipient: activeGroupId ? undefined : activeContact,
                 group_id: activeGroupId || undefined,
-                content,
+                content: encryptedContent,
+                plain_content: content,
+                integrity_hash: await hashMessageContent(encryptedContent),
                 timestamp
             };
             queueOutgoingMessage(payload);
@@ -3281,13 +3313,18 @@
             const msgId = 'msg-' + (window.crypto && crypto.randomUUID
                 ? crypto.randomUUID()
                 : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+            const encryptedAudio = window.E2E
+                ? await E2E.encryptText(audioMarkup, groupId ? null : recipient, groupId)
+                : audioMarkup;
             const payload = {
                 type: groupId ? 'send_group_message' : 'send_message',
                 msg_id: msgId,
                 sender: currentUser,
                 recipient: groupId ? undefined : recipient,
                 group_id: groupId || undefined,
-                content: audioMarkup,
+                content: encryptedAudio,
+                plain_content: audioMarkup,
+                integrity_hash: await hashMessageContent(encryptedAudio),
                 timestamp: timeStr
             };
 
@@ -3382,13 +3419,18 @@
  
                     const msgId = 'msg-' + Date.now();
                     const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                    const encryptedAttachment = window.E2E
+                        ? await E2E.encryptText(formattedContent, activeGroupId ? null : activeContact, activeGroupId)
+                        : formattedContent;
                     const payload = {
                         type: activeGroupId ? "send_group_message" : "send_message",
                         msg_id: msgId,
                         sender: currentUser,
                         recipient: activeGroupId ? undefined : activeContact,
                         group_id: activeGroupId || undefined,
-                        content: formattedContent,
+                        content: encryptedAttachment,
+                        plain_content: formattedContent,
+                        integrity_hash: await hashMessageContent(encryptedAttachment),
                         timestamp: timeStr
                     };
  

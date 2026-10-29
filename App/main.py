@@ -32,6 +32,7 @@ from auth_service import (
 )
 import profile_service
 import push_service
+import e2e_service
  
  
 class RegisterSchema(BaseModel):
@@ -91,6 +92,10 @@ class GroupCreateSchema(BaseModel):
     name: str = ""
     members: list[str] = Field(default_factory=list)
     icon: str = "👥"
+
+
+class E2EPublicKeySchema(BaseModel):
+    public_key: str = ""
 
 
 MAX_FAILED_ATTEMPTS = 5
@@ -939,6 +944,11 @@ def persist_websocket_group_message(
                 raise ValueError("Message ID conflicts with an existing message")
 
         if inserted:
+            mention_preview = (
+                e2e_service.ENCRYPTED_MENTION_PREVIEW
+                if e2e_service.is_encrypted_content(content)
+                else content.replace("\n", " ").strip()[:180]
+            )
             for mentioned_user in mentioned_users:
                 conn.execute(
                     """INSERT OR IGNORE INTO mention_notifications
@@ -946,7 +956,7 @@ def persist_websocket_group_message(
                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (
                         notification_id_for(msg_id, mentioned_user), mentioned_user, msg_id,
-                        group_id, group_name, sender, content.replace("\n", " ").strip()[:180],
+                        group_id, group_name, sender, mention_preview,
                     ),
                 )
         conn.commit()
@@ -1280,7 +1290,12 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     continue
 
                 # The server resolves @names against this group's current membership.
-                mentioned_users = extract_group_mentions(content, group_members, sender=username)
+                if e2e_service.is_encrypted_content(content):
+                    mentioned_users = e2e_service.filter_client_mentions(
+                        data.get("mentioned_users"), group_members, sender=username
+                    )
+                else:
+                    mentioned_users = extract_group_mentions(content, group_members, sender=username)
 
                 provided_integrity_hash = data.get("integrity_hash")
                 if provided_integrity_hash is not None and not verify_content_sha256(
@@ -1373,7 +1388,11 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
 
                     # USER_MENTIONS_WEB_FR25: distinct live event in addition to the group message.
                     if mentioned_users:
-                        content_preview = content.replace("\n", " ").strip()[:180]
+                        content_preview = (
+                            e2e_service.ENCRYPTED_MENTION_PREVIEW
+                            if e2e_service.is_encrypted_content(content)
+                            else content.replace("\n", " ").strip()[:180]
+                        )
                         await scalability_engine.gather_bounded(
                             (
                                 lambda target=mentioned_user: manager.broadcast_user(
@@ -1462,6 +1481,34 @@ def current_username(request: Request) -> str:
 
 def client_ip(request: Request):
     return request.client.host if request.client else None
+
+
+# --- End-to-End Encryption Public Key Directory (NFR-04, Issue #44) ---
+@app.post("/api/e2e/keys")
+async def upload_e2e_public_key(payload: E2EPublicKeySchema, request: Request):
+    """Save the logged-in user's public ECDH key (server never receives private keys)."""
+    username = current_username(request)
+    try:
+        record = e2e_service.save_public_key(username, payload.public_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, **record}
+
+
+@app.get("/api/e2e/keys/{target_username}")
+async def fetch_e2e_public_key(target_username: str, request: Request):
+    """Return a user's public ECDH key so the caller's browser can derive a shared AES key."""
+    current_username(request)
+    clean_target = target_username.strip()
+    if not clean_target:
+        raise HTTPException(status_code=400, detail="Username is required.")
+    record = e2e_service.get_public_key(clean_target)
+    return {
+        "username": clean_target,
+        "has_key": record is not None,
+        "public_key": record["public_key"] if record else None,
+        "updated_at": record["updated_at"] if record else None,
+    }
 
 
 @app.get("/api/gifs/config")

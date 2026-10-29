@@ -123,6 +123,11 @@ def init_db():
           sent_at INTEGER NOT NULL,
           PRIMARY KEY (msg_id, endpoint)
         );
+        CREATE TABLE IF NOT EXISTS user_e2e_keys (
+          username TEXT PRIMARY KEY,
+          public_key TEXT NOT NULL,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
 
         ''')
         columns = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
