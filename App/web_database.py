@@ -31,10 +31,18 @@ def init_db():
           conversation_id TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL, recipient TEXT,
           group_id TEXT, content TEXT NOT NULL, timestamp TEXT NOT NULL,
           status TEXT NOT NULL DEFAULT 'sent', edited INTEGER NOT NULL DEFAULT 0,
-          edited_at TEXT, deleted_everyone INTEGER NOT NULL DEFAULT 0, integrity_hash TEXT, reply_to_msg_id TEXT);
+          edited_at TEXT, deleted_everyone INTEGER NOT NULL DEFAULT 0, integrity_hash TEXT, reply_to_msg_id TEXT, mentioned_users TEXT NOT NULL DEFAULT '[]');
         CREATE TABLE IF NOT EXISTS message_receipts(
           msg_id TEXT NOT NULL, username TEXT NOT NULL, delivered_at TEXT, read_at TEXT,
           PRIMARY KEY(msg_id,username), FOREIGN KEY(msg_id) REFERENCES messages(msg_id) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS mention_notifications(
+          notification_id TEXT PRIMARY KEY, username TEXT NOT NULL, msg_id TEXT NOT NULL,
+          group_id TEXT NOT NULL, group_name TEXT NOT NULL, sender TEXT NOT NULL,
+          content_preview TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          read_at TEXT, UNIQUE(username, msg_id),
+          FOREIGN KEY(msg_id) REFERENCES messages(msg_id) ON DELETE CASCADE);
+        CREATE INDEX IF NOT EXISTS idx_mention_notifications_user_read_created
+          ON mention_notifications(username, read_at, created_at);
         CREATE TABLE IF NOT EXISTS user_message_deletions(
           msg_id TEXT NOT NULL, username TEXT NOT NULL, deleted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           PRIMARY KEY(msg_id,username), FOREIGN KEY(msg_id) REFERENCES messages(msg_id) ON DELETE CASCADE);
@@ -120,7 +128,8 @@ def init_db():
           "conversation_id": "TEXT NOT NULL DEFAULT ''",
           "group_id": "TEXT", "edited": "INTEGER NOT NULL DEFAULT 0",
           "edited_at": "TEXT", "deleted_everyone": "INTEGER NOT NULL DEFAULT 0",
-          "integrity_hash": "TEXT", "reply_to_msg_id": "TEXT"
+          "integrity_hash": "TEXT", "reply_to_msg_id": "TEXT",
+          "mentioned_users": "TEXT NOT NULL DEFAULT '[]'"
         }
         for name, definition in migrations.items():
             if name not in columns:

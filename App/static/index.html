@@ -114,6 +114,26 @@
         #toast[hidden] { display: none; }
 
         /* --- Stickers and GIF picker (Issue #40) --- */
+
+        /* USER_MENTIONS_WEB_FR25: group @mention autocomplete and highlight. */
+        #chat-area { position: relative; }
+        .mention-suggestions {
+            position: absolute; left: 16px; bottom: 76px; z-index: 1200;
+            width: min(320px, calc(100% - 32px)); max-height: 220px; overflow-y: auto;
+            padding: 5px; border: 1px solid #38516e; border-radius: 9px;
+            background: #182334; box-shadow: 0 10px 30px rgba(0,0,0,.4);
+        }
+        .mention-suggestions[hidden] { display: none !important; }
+        .mention-suggestion {
+            display: block; width: 100%; padding: 9px 11px; text-align: left;
+            background: transparent; color: #eaf3ff; border-radius: 6px; cursor: pointer;
+        }
+        .mention-suggestion:hover, .mention-suggestion[aria-selected="true"] { background: #087bf0; }
+        .mention-empty { padding: 9px 11px; color: #a7b6ca; font-size: 12px; }
+        .message-mention-highlight {
+            color: #9ee7ff; background: rgba(0,123,255,.18); padding: 0 2px;
+            border-radius: 3px; font-weight: 700;
+        }
         #gif-picker-dialog { width: min(720px, calc(100% - 24px)); max-height: 86vh; margin: auto; padding: 18px; border: 1px solid #2e3b52; border-radius: 12px; background: #1a2332; color: #fff; }
         #gif-picker-dialog::backdrop { background: rgba(0, 0, 0, 0.72); }
         .gif-picker-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
@@ -404,13 +424,14 @@
             </div>
             <button type="button" id="reply-composer-cancel" onclick="cancelReply()" aria-label="Cancel reply">Cancel</button>
         </div>
-        <div id="input-area">
+        <div id="mention-suggestions" class="mention-suggestions" role="listbox" aria-label="Group member suggestions" hidden></div>
+    <div id="input-area">
             <input type="file" id="file-input" style="display:none;" onchange="uploadFile()">
             <button type="button" onclick="document.getElementById('file-input').click()" title="Attach a file" aria-label="Attach a file">&#128206;</button>
             <button id="gif-picker-open" type="button" onclick="openGifPicker('gif')" title="Send a GIF or sticker" aria-label="Send a GIF or sticker">GIFs</button>
             <button type="button" id="voice-record-button" onclick="toggleVoiceRecording()" title="Record a voice message" aria-label="Record a voice message">&#127908;</button>
             <span id="voice-record-status" role="status" aria-live="polite" hidden></span>
-            <input type="text" id="message-input" placeholder="Type a message..." onkeydown="if(event.key==='Enter') sendMessage()">
+            <input type="text" id="message-input" placeholder="Type a message..." oninput="handleMentionInput(event)" onkeydown="handleMessageInputKeydown(event)" autocomplete="off" aria-autocomplete="list" aria-controls="mention-suggestions">
             <button onclick="sendMessage()">Send</button>
         </div>
     </div>
@@ -515,6 +536,9 @@
         let activeGroup = null;
         let lastGroups = [];
         let groupMemberCandidates = [];
+        let mentionSuggestionRange = null;
+        let visibleMentionCandidates = [];
+        let mentionActiveIndex = 0;
         let ws = null;
         let replyingTo = null;
         const renderedMessages = new Map();
@@ -1252,6 +1276,7 @@
             resetConnectionState();
             loadLastSeenId();
             initWebSocket();
+            loadPendingMentionNotifications();
             Promise.all([loadMuted(), loadBlocked()]).finally(loadContacts);   // load safety settings before rendering the contact actions
             clearInterval(idleTimer);
             idleTimer = setInterval(checkIdle, 10000);
@@ -2102,7 +2127,225 @@
             }
         }
 
+        // USER_MENTIONS_WEB_FR25: accessible @username completion for the active group.
+        function activeGroupMemberNames() {
+            const members = Array.isArray(activeGroup?.members) ? activeGroup.members : [];
+            return [...new Map(members
+                .map(member => typeof member === 'string' ? member : member?.username)
+                .filter(name => typeof name === 'string' && name && name !== currentUser)
+                .map(name => [name.toLowerCase(), name])).values()];
+        }
+
+        function getMentionedGroupMembers(content) {
+            if (!activeGroupId) return [];
+            const memberMap = new Map(activeGroupMemberNames().map(name => [name.toLowerCase(), name]));
+            const found = [];
+            const seen = new Set();
+            const pattern = /(?<![A-Za-z0-9_@])@([A-Za-z0-9_]{3,30})\b/g;
+            for (const match of String(content || '').matchAll(pattern)) {
+                const canonical = memberMap.get(match[1].toLowerCase());
+                if (canonical && !seen.has(canonical.toLowerCase())) {
+                    seen.add(canonical.toLowerCase());
+                    found.push(canonical);
+                }
+            }
+            return found;
+        }
+
+        function hideMentionSuggestions() {
+            const box = document.getElementById('mention-suggestions');
+            if (box) {
+                box.hidden = true;
+                box.replaceChildren();
+            }
+            mentionSuggestionRange = null;
+            visibleMentionCandidates = [];
+            mentionActiveIndex = 0;
+        }
+
+        function chooseMentionSuggestion(username) {
+            const input = document.getElementById('message-input');
+            const range = mentionSuggestionRange;
+            if (!input || !range) return hideMentionSuggestions();
+            const end = input.selectionStart;
+            input.value = input.value.slice(0, range.start) + '@' + username + ' ' + input.value.slice(end);
+            const caret = range.start + username.length + 2;
+            input.focus();
+            input.setSelectionRange(caret, caret);
+            hideMentionSuggestions();
+        }
+
+        function renderMentionSuggestions(query) {
+            const box = document.getElementById('mention-suggestions');
+            if (!box) return;
+            const foldedQuery = query.toLowerCase();
+            visibleMentionCandidates = activeGroupMemberNames()
+                .filter(name => name.toLowerCase().startsWith(foldedQuery))
+                .slice(0, 8);
+            mentionActiveIndex = 0;
+            box.replaceChildren();
+            if (!visibleMentionCandidates.length) {
+                const empty = document.createElement('div');
+                empty.className = 'mention-empty';
+                empty.textContent = 'No matching group members.';
+                box.appendChild(empty);
+                box.hidden = false;
+                return;
+            }
+            visibleMentionCandidates.forEach((username, index) => {
+                const option = document.createElement('button');
+                option.type = 'button';
+                option.className = 'mention-suggestion';
+                option.setAttribute('role', 'option');
+                option.setAttribute('aria-selected', index === mentionActiveIndex ? 'true' : 'false');
+                option.textContent = '@' + username;
+                option.addEventListener('mousedown', event => event.preventDefault());
+                option.addEventListener('click', () => chooseMentionSuggestion(username));
+                box.appendChild(option);
+            });
+            box.hidden = false;
+        }
+
+        function handleMentionInput(event) {
+            const input = event && event.target ? event.target : document.getElementById('message-input');
+            if (!input || !activeGroupId || !activeGroup) {
+                hideMentionSuggestions();
+                return;
+            }
+            const caret = input.selectionStart;
+            const beforeCaret = input.value.slice(0, caret);
+            const atIndex = beforeCaret.lastIndexOf('@');
+            if (atIndex < 0 || (atIndex > 0 && /[A-Za-z0-9_@]/.test(beforeCaret[atIndex - 1]))) {
+                hideMentionSuggestions();
+                return;
+            }
+            const query = beforeCaret.slice(atIndex + 1);
+            if (!/^[A-Za-z0-9_]{0,30}$/.test(query)) {
+                hideMentionSuggestions();
+                return;
+            }
+            mentionSuggestionRange = { start: atIndex };
+            renderMentionSuggestions(query);
+        }
+
+        function handleMessageInputKeydown(event) {
+            const box = document.getElementById('mention-suggestions');
+            if (box && !box.hidden && visibleMentionCandidates.length) {
+                if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                    event.preventDefault();
+                    const delta = event.key === 'ArrowDown' ? 1 : -1;
+                    mentionActiveIndex = (mentionActiveIndex + delta + visibleMentionCandidates.length) % visibleMentionCandidates.length;
+                    [...box.querySelectorAll('.mention-suggestion')].forEach((button, index) => {
+                        button.setAttribute('aria-selected', index === mentionActiveIndex ? 'true' : 'false');
+                    });
+                    return;
+                }
+                if (event.key === 'Enter' || event.key === 'Tab') {
+                    event.preventDefault();
+                    chooseMentionSuggestion(visibleMentionCandidates[mentionActiveIndex]);
+                    return;
+                }
+                if (event.key === 'Escape') {
+                    event.preventDefault();
+                    hideMentionSuggestions();
+                    return;
+                }
+            } else if (event.key === 'Escape') {
+                hideMentionSuggestions();
+                return;
+            }
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                sendMessage();
+            }
+        }
+
+        function highlightMentionedUsers(container, mentionedUsers) {
+            const allowed = new Set((Array.isArray(mentionedUsers) ? mentionedUsers : [])
+                .filter(name => typeof name === 'string').map(name => name.toLowerCase()));
+            if (!container || !allowed.size) return;
+            const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+            const textNodes = [];
+            while (walker.nextNode()) {
+                const node = walker.currentNode;
+                if (node.parentElement && node.parentElement.closest('script,style,a,button,.message-status,.message-reply-quote,.message-mention-highlight')) continue;
+                if (node.nodeValue && node.nodeValue.includes('@')) textNodes.push(node);
+            }
+            const pattern = /(^|[^A-Za-z0-9_@])@([A-Za-z0-9_]{3,30})\b/g;
+            for (const node of textNodes) {
+                const text = node.nodeValue;
+                pattern.lastIndex = 0;
+                let match;
+                let last = 0;
+                let changed = false;
+                const fragment = document.createDocumentFragment();
+                while ((match = pattern.exec(text)) !== null) {
+                    const mentionStart = match.index + match[1].length;
+                    const username = match[2];
+                    if (!allowed.has(username.toLowerCase())) continue;
+                    fragment.appendChild(document.createTextNode(text.slice(last, mentionStart)));
+                    const span = document.createElement('span');
+                    span.className = 'message-mention-highlight';
+                    span.textContent = '@' + username;
+                    fragment.appendChild(span);
+                    last = mentionStart + username.length + 1;
+                    changed = true;
+                }
+                if (changed) {
+                    fragment.appendChild(document.createTextNode(text.slice(last)));
+                    node.replaceWith(fragment);
+                }
+            }
+        }
+
+        async function markMentionNotificationRead(notificationId) {
+            if (!notificationId) return;
+            try {
+                await fetch(`/api/mentions/${encodeURIComponent(notificationId)}/read`, { method: 'POST' });
+            } catch (error) {
+                console.warn('Could not mark mention notification read:', error);
+            }
+        }
+
+        function handleMentionNotification(data) {
+            const text = `@${data.sender || 'Someone'} mentioned you in ${data.group_name || 'a group'}: ${data.content_preview || 'Open the group to view the message.'}`;
+            showToast('🔔 ' + text, 8000);
+            if (document.visibilityState === 'visible') {
+                markMentionNotificationRead(data.notification_id);
+            } else if ('Notification' in window && Notification.permission === 'granted') {
+                try {
+                    new Notification('You were mentioned', { body: text, tag: data.notification_id || data.msg_id });
+                    markMentionNotificationRead(data.notification_id);
+                } catch (error) {
+                    console.warn('Could not display system mention notification:', error);
+                }
+            }
+        }
+
+        async function loadPendingMentionNotifications() {
+            if (!currentUser || !authToken) return;
+            try {
+                const response = await fetch('/api/mentions?unread_only=true');
+                if (!response.ok) return;
+                const data = await response.json();
+                const notifications = Array.isArray(data.notifications) ? data.notifications : [];
+                if (!notifications.length) return;
+                const latest = notifications[0];
+                showToast(notifications.length > 1
+                    ? `🔔 You have ${notifications.length} unread mention notifications. Latest: @${latest.sender} mentioned you in ${latest.group_name}.`
+                    : `🔔 @${latest.sender} mentioned you in ${latest.group_name}: ${latest.content_preview}`, 8000);
+                await Promise.all(notifications.map(item => markMentionNotificationRead(item.notification_id)));
+            } catch (error) {
+                console.warn('Could not load unread mention notifications:', error);
+            }
+        }
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible' && currentUser) loadPendingMentionNotifications();
+        });
+
         function selectGroup(group) {
+            hideMentionSuggestions();
             if (!group || !group.group_id) return;
             if (activeGroupId !== group.group_id) cancelReply();
             activeContact = null;
@@ -2183,6 +2426,7 @@
         }
 
         function selectContact(contact) {
+            hideMentionSuggestions();
             if (activeContact !== contact || activeGroupId) cancelReply();
             activeContact = contact;
             activeGroupId = null;
@@ -2221,14 +2465,14 @@
 
                 (data.history || []).forEach(msg => {
                     if (msg.msg_id) knownIds.add(msg.msg_id);
-                    appendMessageUI(msg.sender, msg.content, msg.timestamp, msg.status, msg.msg_id, msg.reply_preview);
+                    appendMessageUI(msg.sender, msg.content, msg.timestamp, msg.status, msg.msg_id, msg.reply_preview, msg.mentioned_users || []);
                 });
 
                 // Keep queued messages visible after refresh until the server acknowledges them.
                 readOutbox()
                     .filter(msg => (groupIdAtRequest ? msg.group_id === groupIdAtRequest : (!msg.group_id && msg.recipient === contactAtRequest)) && !knownIds.has(msg.msg_id))
                     .forEach(msg => {
-                        appendMessageUI(currentUser, msg.content, msg.timestamp, 'sending', msg.msg_id, msg.reply_preview);
+                        appendMessageUI(currentUser, msg.content, msg.timestamp, 'sending', msg.msg_id, msg.reply_preview, groupIdAtRequest ? getMentionedGroupMembers(msg.content) : []);
                         setMessageStatus(msg.msg_id, '…', 'Queued; waiting for server confirmation');
                     });
             } catch (error) {
@@ -2267,6 +2511,10 @@
 
         function handleIncomingSignalVerified(data) {
 
+            if (data.type === "mention_notification") {
+                handleMentionNotification(data);
+                return;
+            }
             if (data.type === "performance_metric") {
                 handlePerformanceMetric(data);
                 return;
@@ -2278,7 +2526,7 @@
                 noteSeenId(data.id);
                 rememberLiveId(data.msg_id);
                 if (data.group_id && activeGroupId === data.group_id) {
-                    appendMessageUI(currentUser, data.content, data.timestamp, data.status || 'sent', data.msg_id);
+                    appendMessageUI(currentUser, data.content, data.timestamp, data.status || 'sent', data.msg_id, null, data.mentioned_users || []);
                 } else if (!data.group_id && activeContact === data.recipient) {
                     appendMessageUI(currentUser, data.content, data.timestamp, data.status || 'sent', data.msg_id);
                 }
@@ -2289,7 +2537,7 @@
                 rememberLiveId(data.msg_id);
                 if (data.group_id) {
                     if (activeGroupId === data.group_id) {
-                        appendMessageUI(data.sender, data.content, data.timestamp, 'delivered', data.msg_id);
+                        appendMessageUI(data.sender, data.content, data.timestamp, 'delivered', data.msg_id, null, data.mentioned_users || []);
                     } else {
                         showToast(`New message in ${data.group_name || 'a group chat'} from @${data.sender}.`);
                     }
@@ -2492,7 +2740,8 @@
                 if (payload.sender !== currentUser) return;
                 payload.integrity_hash = await hashMessageContent(payload.content);
                 queueOutgoingMessage(payload);
-                appendMessageUI(currentUser, content, payload.timestamp, 'sending', msgId, reply);
+                hideMentionSuggestions();
+                appendMessageUI(currentUser, content, payload.timestamp, 'sending', msgId, reply, groupIdAtSend ? getMentionedGroupMembers(content) : []);
                 if (replyingTo && reply && replyingTo.msg_id === reply.msg_id) cancelReply();
                 setMessageStatus(msgId, '…', 'Waiting for server integrity verification and save');
 
@@ -2586,13 +2835,14 @@
             window.setTimeout(() => target.classList.remove('reply-highlight'), 1800);
         }
 
-        function appendMessageUI(sender, content, timeStr, status, msgId, replyPreview = null) {
+        function appendMessageUI(sender, content, timeStr, status, msgId, replyPreview = null, mentionedUsers = []) {
             const list = document.getElementById('messages-list');
             if (msgId && document.getElementById(`msg-${msgId}`)) return;
             if (msgId) {
                 renderedMessages.set(msgId, {
                     msg_id: msgId, sender, content, timestamp: timeStr, status,
-                    reply_preview: replyPreview || null
+                    reply_preview: replyPreview || null,
+                    mentioned_users: Array.isArray(mentionedUsers) ? mentionedUsers : []
                 });
             }
             const msgDiv = document.createElement('div');
@@ -2630,6 +2880,7 @@
             if (quote) body.appendChild(quote);
             const contentElement = document.createElement('div');
             contentElement.innerHTML = content;
+            highlightMentionedUsers(contentElement, mentionedUsers);
             body.appendChild(contentElement);
             msgDiv.appendChild(body);
 
