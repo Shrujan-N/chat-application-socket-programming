@@ -3,7 +3,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 import asyncio
 import logging
+import json
 from message_integrity import content_sha256, verify_content_sha256
+from web_user_mentions import extract_group_mentions, notification_id_for
 import performance as performance_metrics
 from availability import check_database_connection, get_availability_summary
 import time
@@ -808,12 +810,20 @@ def persist_websocket_group_message(
     content: str,
     timestamp: str,
     integrity_hash: Optional[str] = None,
+    mentioned_users: Optional[list[str]] = None,
+    group_name: str = "",
 ):
-    """Persist a group message once and reject conflicting retries."""
+    """Persist a group message and its mention alerts transactionally."""
     expected_hash = content_sha256(content)
     if integrity_hash is not None and not verify_content_sha256(content, integrity_hash):
         raise ValueError("Message content checksum mismatch")
 
+    mentioned_users = list(dict.fromkeys(
+        user.strip() for user in (mentioned_users or [])
+        if isinstance(user, str) and user.strip()
+    ))
+    mentions_json = json.dumps(mentioned_users, ensure_ascii=False, separators=(",", ":"))
+    group_name = (group_name or group_id).strip() or group_id
     conn = None
     try:
         conn = get_db()
@@ -822,17 +832,17 @@ def persist_websocket_group_message(
             """
             INSERT OR IGNORE INTO messages
                 (msg_id, conversation_type, conversation_id, sender, recipient,
-                 group_id, content, timestamp, status, integrity_hash)
-            VALUES (?, 'group', ?, ?, '', ?, ?, ?, 'sent', ?)
+                 group_id, content, timestamp, status, integrity_hash, mentioned_users)
+            VALUES (?, 'group', ?, ?, '', ?, ?, ?, 'sent', ?, ?)
             """,
-            (msg_id, f"group:{group_id}", sender, group_id, content, timestamp, expected_hash),
+            (msg_id, f"group:{group_id}", sender, group_id, content, timestamp, expected_hash, mentions_json),
         )
         inserted = cursor.rowcount == 1
 
         if not inserted:
             existing = conn.execute(
                 """
-                SELECT sender, conversation_type, group_id, content, timestamp, integrity_hash
+                SELECT sender, conversation_type, group_id, content, timestamp, integrity_hash, mentioned_users
                 FROM messages WHERE msg_id = ?
                 """,
                 (msg_id,),
@@ -843,10 +853,22 @@ def persist_websocket_group_message(
                 or existing["group_id"] != group_id
                 or existing["content"] != content
                 or existing["timestamp"] != timestamp
+                or (existing["mentioned_users"] or "[]") != mentions_json
                 or not verify_content_sha256(existing["content"], existing["integrity_hash"])
             ):
                 raise ValueError("Message ID conflicts with an existing message")
 
+        if inserted:
+            for mentioned_user in mentioned_users:
+                conn.execute(
+                    """INSERT OR IGNORE INTO mention_notifications
+                       (notification_id, username, msg_id, group_id, group_name, sender, content_preview)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        notification_id_for(msg_id, mentioned_user), mentioned_user, msg_id,
+                        group_id, group_name, sender, content.replace("\n", " ").strip()[:180],
+                    ),
+                )
         conn.commit()
         return inserted
     except Exception:
@@ -1170,6 +1192,9 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     })
                     continue
 
+                # The server resolves @names against this group's current membership.
+                mentioned_users = extract_group_mentions(content, group_members, sender=username)
+
                 provided_integrity_hash = data.get("integrity_hash")
                 if provided_integrity_hash is not None and not verify_content_sha256(
                     content, provided_integrity_hash
@@ -1185,7 +1210,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     try:
                         inserted = persist_websocket_group_message(
                             msg_id, group_id, username, content, timestamp,
-                            provided_integrity_hash,
+                            provided_integrity_hash, mentioned_users, group["name"],
                         )
                     except ValueError:
                         await websocket.send_json({
@@ -1229,6 +1254,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                             "status": "sent",
                             "integrity_hash": content_sha256(content),
                             "id": get_message_row_id(msg_id),
+                            "mentioned_users": mentioned_users,
                         }
                         await manager.broadcast_user(username, frame, exclude=websocket)
 
@@ -1252,10 +1278,23 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         "timestamp": timestamp,
                         "integrity_hash": content_sha256(content),
                         "id": get_message_row_id(msg_id),
+                        "mentioned_users": mentioned_users,
                     }
                     for member in group_members:
                         if member != username:
                             await manager.broadcast_user(member, incoming_frame)
+
+                    # USER_MENTIONS_WEB_FR25: distinct live event in addition to the group message.
+                    for mentioned_user in mentioned_users:
+                        await manager.broadcast_user(mentioned_user, {
+                            "type": "mention_notification",
+                            "notification_id": notification_id_for(msg_id, mentioned_user),
+                            "msg_id": msg_id,
+                            "group_id": group_id,
+                            "group_name": group["name"],
+                            "sender": username,
+                            "content_preview": content.replace("\n", " ").strip()[:180],
+                        })
 
             elif message_type == "visibility":
                 manager.set_visibility(username, websocket, bool(data.get("visible")))
@@ -1874,7 +1913,7 @@ async def get_group_history(group_id: str, request: Request):
         rows = conn.execute(
             """
             SELECT rowid AS id, msg_id, sender, content, timestamp, status,
-                   integrity_hash, reply_to_msg_id, group_id, conversation_type
+                   integrity_hash, reply_to_msg_id, group_id, conversation_type, mentioned_users
             FROM messages
             WHERE conversation_type = 'group' AND group_id = ?
             ORDER BY rowid ASC
@@ -1887,11 +1926,49 @@ async def get_group_history(group_id: str, request: Request):
             item = dict(row)
             item.pop("integrity_hash", None)
             item["reply_preview"] = None
+            try:
+                item["mentioned_users"] = json.loads(item.get("mentioned_users") or "[]")
+            except (TypeError, ValueError):
+                item["mentioned_users"] = []
             history.append(item)
         return {"group": group, "history": history}
     finally:
         conn.close()
 
+
+
+# USER_MENTIONS_WEB_FR25: authenticated, durable mention notifications.
+@app.get("/api/mentions")
+async def list_mention_notifications(request: Request, unread_only: bool = True):
+    username = current_username(request)
+    condition = " AND read_at IS NULL" if unread_only else ""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT notification_id, username, msg_id, group_id, group_name,
+                      sender, content_preview, created_at, read_at
+               FROM mention_notifications
+               WHERE username = ?""" + condition + " ORDER BY created_at DESC, rowid DESC LIMIT 100",
+            (username,),
+        ).fetchall()
+        return {"notifications": [dict(row) for row in rows]}
+    finally:
+        conn.close()
+
+
+@app.post("/api/mentions/{notification_id}/read")
+async def mark_mention_notification_read(notification_id: str, request: Request):
+    username = current_username(request)
+    conn = get_db()
+    try:
+        cursor = conn.execute(
+            "UPDATE mention_notifications SET read_at = CURRENT_TIMESTAMP WHERE notification_id = ? AND username = ?",
+            (notification_id, username),
+        )
+        conn.commit()
+        return {"success": cursor.rowcount > 0}
+    finally:
+        conn.close()
 
 # --- Fetch Conversation History Endpoint (ADDED FOR ISSUE #23) ---
 @app.get("/api/messages/history/{user1}/{user2}")
