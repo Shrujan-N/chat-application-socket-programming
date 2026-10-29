@@ -98,6 +98,10 @@ class E2EPublicKeySchema(BaseModel):
     public_key: str = ""
 
 
+class ReactionSchema(BaseModel):
+    emoji: str = ""
+
+
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_MINUTES = int(os.environ.get("LOCKOUT_MINUTES", "15"))
 PUBLIC_API_PATHS = {
@@ -118,6 +122,12 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from web_database import get_db, init_db as init_web_db
+from reactions_service import (
+    STANDARD_EMOJIS,
+    get_reactions_for_message,
+    get_reactions_for_messages,
+    toggle_message_reaction,
+)
 
 BASE = Path(__file__).resolve().parent
 STATIC = BASE / "static"
@@ -1457,6 +1467,63 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     "type": "message_read_sync", "msg_id": msg_id,
                     "sender": sender, "reader": username, "status": "read"
                 }, exclude=websocket)
+            elif message_type == "toggle_reaction":
+                msg_id = data.get("msg_id")
+                emoji = data.get("emoji")
+                if not isinstance(msg_id, str) or not msg_id.strip() or not isinstance(emoji, str) or not emoji.strip():
+                    await websocket.send_json({"type": "error", "message": "Invalid reaction fields."})
+                    continue
+                msg_id = msg_id.strip()
+                emoji = emoji.strip()
+
+                conn = get_db()
+                try:
+                    msg_row = conn.execute(
+                        "SELECT msg_id, sender, recipient, group_id, conversation_type FROM messages WHERE msg_id = ?",
+                        (msg_id,),
+                    ).fetchone()
+                    if not msg_row:
+                        await websocket.send_json({"type": "error", "message": "Message not found."})
+                        continue
+
+                    if msg_row["conversation_type"] == "group":
+                        group_id = msg_row["group_id"]
+                        membership = conn.execute(
+                            "SELECT 1 FROM group_members WHERE group_id = ? AND username = ?",
+                            (group_id, username),
+                        ).fetchone()
+                        if not membership:
+                            await websocket.send_json({"type": "error", "message": "You are not a member of this group."})
+                            continue
+                        group_recipients = [
+                            r["username"] for r in conn.execute(
+                                "SELECT username FROM group_members WHERE group_id = ?", (group_id,)
+                            ).fetchall()
+                        ]
+                    else:
+                        if username != msg_row["sender"] and username != msg_row["recipient"]:
+                            await websocket.send_json({"type": "error", "message": "You are not part of this conversation."})
+                            continue
+                        group_recipients = None
+
+                    result = toggle_message_reaction(conn, msg_id, username, emoji)
+                finally:
+                    conn.close()
+
+                broadcast_data = {
+                    "type": "reaction_update",
+                    "msg_id": msg_id,
+                    "emoji": emoji,
+                    "username": username,
+                    "action": result["action"],
+                    "reactions": result["reactions"],
+                }
+                if group_recipients:
+                    await manager.broadcast_many_users(group_recipients, broadcast_data)
+                else:
+                    await manager.broadcast_user(msg_row["sender"], broadcast_data)
+                    if msg_row["recipient"] and msg_row["recipient"] != msg_row["sender"]:
+                        await manager.broadcast_user(msg_row["recipient"], broadcast_data)
             else:
                 await websocket.send_json({"type": "error", "message": "Unsupported message type."})
 
@@ -1481,6 +1548,93 @@ def current_username(request: Request) -> str:
 
 def client_ip(request: Request):
     return request.client.host if request.client else None
+
+
+# --- Message Reactions Endpoints (Issue #34, FR-23) ---
+@app.post("/api/messages/{msg_id}/react")
+async def react_to_message_endpoint(msg_id: str, payload: ReactionSchema, request: Request):
+    username = current_username(request)
+    emoji = (payload.emoji or "").strip()
+    if not emoji:
+        raise HTTPException(status_code=400, detail="Emoji cannot be empty.")
+
+    conn = get_db()
+    try:
+        msg_row = conn.execute(
+            "SELECT msg_id, sender, recipient, group_id, conversation_type FROM messages WHERE msg_id = ?",
+            (msg_id,),
+        ).fetchone()
+        if not msg_row:
+            raise HTTPException(status_code=404, detail="Message not found.")
+
+        if msg_row["conversation_type"] == "group":
+            group_id = msg_row["group_id"]
+            membership = conn.execute(
+                "SELECT 1 FROM group_members WHERE group_id = ? AND username = ?",
+                (group_id, username),
+            ).fetchone()
+            if not membership:
+                raise HTTPException(status_code=403, detail="Not a group member.")
+            recipients = [
+                r["username"] for r in conn.execute(
+                    "SELECT username FROM group_members WHERE group_id = ?", (group_id,)
+                ).fetchall()
+            ]
+        else:
+            if username != msg_row["sender"] and username != msg_row["recipient"]:
+                raise HTTPException(status_code=403, detail="Not a participant in this conversation.")
+            recipients = [msg_row["sender"]]
+            if msg_row["recipient"] and msg_row["recipient"] != msg_row["sender"]:
+                recipients.append(msg_row["recipient"])
+
+        result = toggle_message_reaction(conn, msg_id, username, emoji)
+    finally:
+        conn.close()
+
+    broadcast_data = {
+        "type": "reaction_update",
+        "msg_id": msg_id,
+        "emoji": emoji,
+        "username": username,
+        "action": result["action"],
+        "reactions": result["reactions"],
+    }
+    if msg_row["conversation_type"] == "group":
+        await manager.broadcast_many_users(recipients, broadcast_data)
+    else:
+        for u in recipients:
+            await manager.broadcast_user(u, broadcast_data)
+
+    return result
+
+
+@app.get("/api/messages/{msg_id}/reactions")
+async def get_message_reactions_endpoint(msg_id: str, request: Request):
+    username = current_username(request)
+    conn = get_db()
+    try:
+        msg_row = conn.execute(
+            "SELECT msg_id, sender, recipient, group_id, conversation_type FROM messages WHERE msg_id = ?",
+            (msg_id,),
+        ).fetchone()
+        if not msg_row:
+            raise HTTPException(status_code=404, detail="Message not found.")
+        if msg_row["conversation_type"] == "group":
+            group_id = msg_row["group_id"]
+            membership = conn.execute(
+                "SELECT 1 FROM group_members WHERE group_id = ? AND username = ?",
+                (group_id, username),
+            ).fetchone()
+            if not membership:
+                raise HTTPException(status_code=403, detail="Not a group member.")
+        else:
+            if username != msg_row["sender"] and username != msg_row["recipient"]:
+                raise HTTPException(status_code=403, detail="Not a participant in this conversation.")
+
+        reactions = get_reactions_for_message(conn, msg_id)
+        return {"msg_id": msg_id, "reactions": reactions}
+    finally:
+        conn.close()
 
 
 # --- End-to-End Encryption Public Key Directory (NFR-04, Issue #44) ---
@@ -2063,6 +2217,8 @@ async def get_group_history(group_id: str, request: Request):
             (group_id,),
         ).fetchall()
         assert_message_integrity(rows)
+        msg_ids = [row["msg_id"] for row in rows if row["msg_id"]]
+        reactions_map = get_reactions_for_messages(conn, msg_ids)
         history = []
         for row in rows:
             item = dict(row)
@@ -2072,6 +2228,7 @@ async def get_group_history(group_id: str, request: Request):
                 item["mentioned_users"] = json.loads(item.get("mentioned_users") or "[]")
             except (TypeError, ValueError):
                 item["mentioned_users"] = []
+            item["reactions"] = reactions_map.get(item["msg_id"], [])
             history.append(item)
         return {"group": group, "history": history}
     finally:
@@ -2116,25 +2273,30 @@ async def mark_mention_notification_read(notification_id: str, request: Request)
 @app.get("/api/messages/history/{user1}/{user2}")
 async def get_chat_history(user1: str, user2: str):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT msg_id, sender, recipient, content, timestamp, status, integrity_hash, reply_to_msg_id 
-        FROM messages 
-        WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)
-        ORDER BY rowid ASC
-    """, (user1, user2, user2, user1))
-    rows = cursor.fetchall()
-    conn.close()
-    assert_message_integrity(rows)
-    history = []
-    for row in rows:
-        item = dict(row)
-        item.pop("integrity_hash", None)
-        item["reply_preview"] = get_message_reply_preview(
-            item.get("reply_to_msg_id"), item["sender"], item["recipient"]
-        )
-        history.append(item)
-    return {"history": history}
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT msg_id, sender, recipient, content, timestamp, status, integrity_hash, reply_to_msg_id 
+            FROM messages 
+            WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)
+            ORDER BY rowid ASC
+        """, (user1, user2, user2, user1))
+        rows = cursor.fetchall()
+        assert_message_integrity(rows)
+        msg_ids = [row["msg_id"] for row in rows if row["msg_id"]]
+        reactions_map = get_reactions_for_messages(conn, msg_ids)
+        history = []
+        for row in rows:
+            item = dict(row)
+            item.pop("integrity_hash", None)
+            item["reply_preview"] = get_message_reply_preview(
+                item.get("reply_to_msg_id"), item["sender"], item["recipient"]
+            )
+            item["reactions"] = reactions_map.get(item["msg_id"], [])
+            history.append(item)
+        return {"history": history}
+    finally:
+        conn.close()
 
 
 # --- Missed-message sync after a reconnect (FR-21) ---
@@ -2187,11 +2349,14 @@ async def sync_missed_messages(request: Request, since: int = -1):
         ).fetchall()
         assert_message_integrity(rows)
         messages = [dict(row) for row in rows]
+        msg_ids = [m["msg_id"] for m in messages if m.get("msg_id")]
+        reactions_map = get_reactions_for_messages(conn, msg_ids)
         for message in messages:
             message.pop("integrity_hash", None)
             message["reply_preview"] = get_message_reply_preview(
                 message.get("reply_to_msg_id"), message["sender"], message["recipient"]
             )
+            message["reactions"] = reactions_map.get(message.get("msg_id"), [])
 
         newly_delivered = [
             m for m in messages

@@ -25,6 +25,15 @@
         .message-action-row { display:flex; justify-content:flex-end; margin-top:4px; }
         .message-reply-btn { padding:2px 8px; font-size:11px; min-height:0; background:rgba(255,255,255,.08); color:#dbeafe; border:1px solid rgba(255,255,255,.12); border-radius:5px; cursor:pointer; }
         .message-reply-btn:hover { background:rgba(83,189,235,.18); }
+        .reactions-container { display:flex; flex-wrap:wrap; gap:4px; margin-top:4px; }
+        .reaction-pill { display:inline-flex; align-items:center; gap:3px; padding:2px 7px; font-size:11px; background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.14); border-radius:12px; cursor:pointer; user-select:none; transition:all 0.15s ease; color:#e0e6ed; }
+        .reaction-pill:hover { background:rgba(83,189,235,.22); border-color:#53bdeb; }
+        .reaction-pill.reacted { background:rgba(83,189,235,.3); border-color:#53bdeb; color:#ffffff; font-weight:700; }
+        .message-react-btn { padding:2px 6px; font-size:11px; min-height:0; background:rgba(255,255,255,.08); color:#dbeafe; border:1px solid rgba(255,255,255,.12); border-radius:5px; cursor:pointer; margin-left:4px; }
+        .message-react-btn:hover { background:rgba(83,189,235,.18); }
+        .reaction-picker-popup { position:absolute; bottom:100%; right:0; margin-bottom:5px; background:#1e293b; border:1px solid #475569; border-radius:18px; padding:4px 6px; display:flex; gap:4px; box-shadow:0 4px 14px rgba(0,0,0,.5); z-index:100; }
+        .reaction-picker-popup button { background:none; border:none; font-size:16px; cursor:pointer; padding:2px 4px; border-radius:4px; transition:transform 0.1s; }
+        .reaction-picker-popup button:hover { transform:scale(1.25); background:rgba(255,255,255,.12); }
         .message.reply-highlight { outline:2px solid #53bdeb; box-shadow:0 0 0 4px rgba(83,189,235,.16); }
         #reply-composer-preview { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:0 10px 8px; padding:7px 10px; border-left:3px solid #53bdeb; border-radius:6px; background:#1c2939; color:#e5edf7; }
         #reply-composer-preview[hidden] { display:none; }
@@ -2480,7 +2489,7 @@
 
                 decryptedHistory.forEach(msg => {
                     if (msg.msg_id) knownIds.add(msg.msg_id);
-                    appendMessageUI(msg.sender, msg.content, msg.timestamp, msg.status, msg.msg_id, msg.reply_preview, msg.mentioned_users || []);
+                    appendMessageUI(msg.sender, msg.content, msg.timestamp, msg.status, msg.msg_id, msg.reply_preview, msg.mentioned_users || [], msg.reactions || []);
                 });
 
                 // Keep queued messages visible after refresh until the server acknowledges them.
@@ -2531,6 +2540,10 @@
         }
 
         function handleIncomingSignalVerified(data) {
+            if (data.type === "reaction_update") {
+                handleReactionUpdate(data);
+                return;
+            }
 
             if (data.type === "mention_notification") {
                 handleMentionNotification(data);
@@ -2862,14 +2875,100 @@
             window.setTimeout(() => target.classList.remove('reply-highlight'), 1800);
         }
 
-        function appendMessageUI(sender, content, timeStr, status, msgId, replyPreview = null, mentionedUsers = []) {
+        function renderReactionsList(container, reactions, msgId) {
+            container.innerHTML = '';
+            if (!Array.isArray(reactions) || reactions.length === 0) return;
+            reactions.forEach(r => {
+                if (!r.count || r.count <= 0) return;
+                const pill = document.createElement('span');
+                const hasReacted = Array.isArray(r.users) && r.users.includes(currentUser);
+                pill.className = `reaction-pill ${hasReacted ? 'reacted' : ''}`;
+                pill.textContent = `${r.emoji} ${r.count}`;
+                pill.title = (r.users && r.users.length) ? `Reacted: ${r.users.join(', ')}` : '';
+                pill.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    toggleMessageReactionUI(msgId, r.emoji);
+                });
+                container.appendChild(pill);
+            });
+        }
+
+        function openReactionPicker(actionRow, msgId) {
+            const existing = actionRow.querySelector('.reaction-picker-popup');
+            if (existing) {
+                existing.remove();
+                return;
+            }
+            document.querySelectorAll('.reaction-picker-popup').forEach(p => p.remove());
+            const popup = document.createElement('div');
+            popup.className = 'reaction-picker-popup';
+            const emojis = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+            emojis.forEach(emoji => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.textContent = emoji;
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    popup.remove();
+                    toggleMessageReactionUI(msgId, emoji);
+                });
+                popup.appendChild(btn);
+            });
+            actionRow.appendChild(popup);
+            const closeHandler = (e) => {
+                if (!popup.contains(e.target)) {
+                    popup.remove();
+                    document.removeEventListener('click', closeHandler);
+                }
+            };
+            setTimeout(() => document.addEventListener('click', closeHandler), 0);
+        }
+
+        function toggleMessageReactionUI(msgId, emoji) {
+            if (!msgId || !emoji) return;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'toggle_reaction',
+                    msg_id: msgId,
+                    emoji: emoji
+                }));
+            } else {
+                fetch(`/api/messages/${encodeURIComponent(msgId)}/react`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${authToken}`
+                    },
+                    body: JSON.stringify({ emoji: emoji })
+                }).then(r => r.json()).then(data => {
+                    if (data && data.reactions) {
+                        const container = document.getElementById(`reactions-${msgId}`);
+                        if (container) renderReactionsList(container, data.reactions, msgId);
+                    }
+                }).catch(err => console.error('Reaction error:', err));
+            }
+        }
+
+        function handleReactionUpdate(data) {
+            const container = document.getElementById(`reactions-${data.msg_id}`);
+            if (container) {
+                renderReactionsList(container, data.reactions || [], data.msg_id);
+            }
+            if (renderedMessages && renderedMessages.has(data.msg_id)) {
+                const item = renderedMessages.get(data.msg_id);
+                item.reactions = data.reactions || [];
+            }
+        }
+
+        function appendMessageUI(sender, content, timeStr, status, msgId, replyPreview = null, mentionedUsers = [], reactions = []) {
             const list = document.getElementById('messages-list');
             if (msgId && document.getElementById(`msg-${msgId}`)) return;
             if (msgId) {
                 renderedMessages.set(msgId, {
                     msg_id: msgId, sender, content, timestamp: timeStr, status,
                     reply_preview: replyPreview || null,
-                    mentioned_users: Array.isArray(mentionedUsers) ? mentionedUsers : []
+                    mentioned_users: Array.isArray(mentionedUsers) ? mentionedUsers : [],
+                    reactions: Array.isArray(reactions) ? reactions : []
                 });
             }
             const msgDiv = document.createElement('div');
@@ -2916,19 +3015,41 @@
             footer.innerHTML = `${timeStr} ${statusHTML}`;
             msgDiv.appendChild(footer);
 
-            if (msgId && !activeGroupId) {
+            if (msgId) {
+                const reactionsContainer = document.createElement('div');
+                reactionsContainer.className = 'reactions-container';
+                reactionsContainer.id = `reactions-${msgId}`;
+                renderReactionsList(reactionsContainer, reactions, msgId);
+                msgDiv.appendChild(reactionsContainer);
+            }
+
+            if (msgId) {
                 const actionRow = document.createElement('div');
                 actionRow.className = 'message-action-row';
-                const replyButton = document.createElement('button');
-                replyButton.type = 'button';
-                replyButton.className = 'message-reply-btn';
-                replyButton.textContent = '↩ Reply';
-                replyButton.setAttribute('aria-label', `Reply to message from ${sender}`);
-                replyButton.addEventListener('click', event => {
+                actionRow.style.position = 'relative';
+                if (!activeGroupId) {
+                    const replyButton = document.createElement('button');
+                    replyButton.type = 'button';
+                    replyButton.className = 'message-reply-btn';
+                    replyButton.textContent = '↩ Reply';
+                    replyButton.setAttribute('aria-label', `Reply to message from ${sender}`);
+                    replyButton.addEventListener('click', event => {
+                        event.stopPropagation();
+                        startReplyToMessage(msgId);
+                    });
+                    actionRow.appendChild(replyButton);
+                }
+                const reactButton = document.createElement('button');
+                reactButton.type = 'button';
+                reactButton.className = 'message-react-btn';
+                reactButton.textContent = '😀+';
+                reactButton.title = 'Add emoji reaction';
+                reactButton.setAttribute('aria-label', `React to message from ${sender}`);
+                reactButton.addEventListener('click', event => {
                     event.stopPropagation();
-                    startReplyToMessage(msgId);
+                    openReactionPicker(actionRow, msgId);
                 });
-                actionRow.appendChild(replyButton);
+                actionRow.appendChild(reactButton);
                 msgDiv.appendChild(actionRow);
             }
 
