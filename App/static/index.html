@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="/favicon.ico">
     <title>WebSocket Chat Application - Sprint 1</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
@@ -1333,6 +1334,20 @@
         }
  
         // Idle timeout: expire the session after inactivity (30 minutes by default).
+        function isTokenExpired(token) {
+            try {
+                const parts = token.split('.');
+                if (parts.length !== 3) return true;
+                const payload = JSON.parse(atob(parts[1]));
+                if (payload.exp && Date.now() >= (payload.exp - 5) * 1000) {
+                    return true;
+                }
+                return false;
+            } catch (e) {
+                return true;
+            }
+        }
+
         function checkIdle() {
             if (authToken && Date.now() - lastActivity > sessionSeconds * 1000) {
                 endSession('Session expired due to inactivity. Please log in again.');
@@ -1340,6 +1355,7 @@
         }
  
         async function refreshSession() {
+            if (!authToken) return;
             lastRefresh = Date.now();
             try {
                 const response = await window.fetch('/api/session');
@@ -1356,6 +1372,11 @@
         async function restoreSession() {
             const stored = readStoredToken();
             if (!stored) { showLoginScreen(); return; }
+            if (isTokenExpired(stored)) {
+                storeToken(null);
+                showLoginScreen('Session expired. Please log in again.');
+                return;
+            }
             try {
                 const response = await rawFetch('/api/session', { headers: { Authorization: 'Bearer ' + stored } });
                 if (response.status === 401) {

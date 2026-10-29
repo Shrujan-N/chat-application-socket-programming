@@ -1,6 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, FileResponse
 import asyncio
 import logging
 import json
@@ -189,18 +189,34 @@ async def require_session(request: Request, call_next):
     started = time.perf_counter()
     path = request.url.path
 
+    # Prevent 304 Not Modified on static files by stripping conditional caching headers
+    if path.startswith("/static/"):
+        request.scope["headers"] = [
+            (k, v) for (k, v) in request.scope.get("headers", [])
+            if k.lower() not in (b"if-none-match", b"if-modified-since")
+        ]
+
     if path.startswith("/api/") and path not in PUBLIC_API_PATHS:
         try:
             validate_session(get_bearer_token(request))
-        except TokenError:
-            logger.warning(
-                "Rejected unauthenticated API request: method=%s path=%s",
-                request.method,
-                path,
-            )
+        except TokenError as exc:
+            if path == "/api/session":
+                logger.info(
+                    "Session validation info: method=%s path=%s detail=%s",
+                    request.method,
+                    path,
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "Rejected unauthenticated API request: method=%s path=%s",
+                    request.method,
+                    path,
+                )
+            detail = str(exc) if str(exc) else "Authentication required"
             response = JSONResponse(
                 status_code=401,
-                content={"detail": "Authentication required"},
+                content={"detail": detail},
             )
             record_request_metric(request.method, path, response.status_code,
                                   time.perf_counter() - started)
@@ -221,6 +237,10 @@ async def require_session(request: Request, call_next):
 
     duration = time.perf_counter() - started
     record_request_metric(request.method, path, response.status_code, duration)
+
+    if path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
 
     if response.status_code >= 500:
         logger.error(
@@ -346,6 +366,43 @@ async def scalability_summary():
         registry=manager.registry,
         lock_pool=recipient_lock_pool,
         broker=manager.broker,
+    )
+
+
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    '<circle cx="16" cy="16" r="14" fill="#2563EB"/>'
+    '<path d="M9 11 H23 V17 H12 L9 20 Z" fill="#FFFFFF"/>'
+    '</svg>'
+)
+
+DEFAULT_AVATAR_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">'
+    '<rect width="100" height="100" fill="#4B5563"/>'
+    '<circle cx="50" cy="38" r="20" fill="#9CA3AF"/>'
+    '<path d="M20,85 C20,65 35,58 50,58 C65,58 80,65 80,85 Z" fill="#9CA3AF"/>'
+    '</svg>'
+)
+
+
+@app.get("/favicon.ico")
+async def get_favicon():
+    return Response(
+        content=FAVICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"}
+    )
+
+
+@app.get("/uploads/avatars/{filename:path}")
+async def get_avatar_image(filename: str):
+    avatar_path = os.path.join(profile_service.AVATAR_DIR, filename)
+    if os.path.isfile(avatar_path):
+        return FileResponse(avatar_path)
+    return Response(
+        content=DEFAULT_AVATAR_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=3600"}
     )
 
 
@@ -1761,6 +1818,7 @@ def schedule_push(msg_id, sender, recipient, content):
     task.add_done_callback(_background_tasks.discard)
 
 
+@app.get("/service-worker.js")
 @app.get("/sw.js")
 async def service_worker():
     """The service worker must be served from the site root to control the whole app."""
