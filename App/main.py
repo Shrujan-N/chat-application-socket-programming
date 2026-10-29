@@ -8,6 +8,7 @@ from message_integrity import content_sha256, verify_content_sha256
 from web_user_mentions import extract_group_mentions, notification_id_for
 import performance as performance_metrics
 from availability import check_database_connection, get_availability_summary
+import scalability as scalability_engine
 import time
 import os
 import re
@@ -322,6 +323,17 @@ async def performance_latency_summary():
     return performance_metrics.get_latency_summary()
 
 
+# --- Scalability (Issue #42) ---
+@app.get("/api/scalability")
+async def scalability_summary():
+    # Auth is enforced by the existing /api middleware.
+    return scalability_engine.get_scalability_summary(
+        registry=manager.registry,
+        lock_pool=recipient_lock_pool,
+        broker=manager.broker,
+    )
+
+
 # Mount Static Files and Uploads
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
  
@@ -591,23 +603,46 @@ async def logout_user(request: Request):
     return {"success": True, "message": "Logged out."}
  
  
-# --- Active WebSocket Registry (Issue #19, #46; Multi-device FR-26) ---
+# --- Active WebSocket Registry (Issue #19, #46; Multi-device FR-26; Scalability #42) ---
 class ConnectionManager:
-    """Track every live device socket while retaining the legacy primary-socket map."""
+    """Sharded multi-device WebSocket gateway manager with Pub/Sub fan-out."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        shard_count: int = scalability_engine.REGISTRY_SHARD_COUNT,
+        max_connections: int = scalability_engine.MAX_CONCURRENT_CONNECTIONS,
+        broker: Optional[scalability_engine.InMemoryPubSubBroker] = None,
+        node_id: Optional[str] = None,
+    ):
         # Kept for older callers/tests that expect one representative socket per user.
         self.active_connections: Dict[str, WebSocket] = {}
         self.device_connections: Dict[str, list[WebSocket]] = {}
         self.device_visibility: Dict[str, Dict[int, bool]] = {}
         # Aggregate visibility means any active device is foreground/visible.
         self.visible: Dict[str, bool] = {}
+        self.registry = scalability_engine.ShardedConnectionRegistry(
+            shard_count=shard_count,
+            max_connections=max_connections,
+        )
+        self.node_id = node_id or os.environ.get("CHAT_GATEWAY_NODE_ID", "gateway-primary")
+        self.broker = broker or scalability_engine.InMemoryPubSubBroker()
+        self.broker.subscribe_node(self.node_id, self._deliver_local_user)
 
     async def connect(self, username: str, websocket: WebSocket):
+        existing_devices = self.device_connections.get(username, [])
+        already_registered = any(existing is websocket for existing in existing_devices)
+        if not already_registered and not self.registry.can_accept():
+            self.registry.rejected_over_capacity += 1
+            raise scalability_engine.CapacityExceededError(
+                f"Max concurrent connections ({self.registry.max_connections}) reached"
+            )
+
         await websocket.accept()
         devices = self.device_connections.setdefault(username, [])
         if all(existing is not websocket for existing in devices):
             devices.append(websocket)
+        self.registry.register(username, websocket, enforce_capacity=False)
         self.device_visibility.setdefault(username, {})[id(websocket)] = True
         self.active_connections[username] = websocket
         self._refresh_visibility(username)
@@ -636,29 +671,73 @@ class ConnectionManager:
         self.device_visibility.setdefault(username, {})[id(websocket)] = bool(visible)
         self._refresh_visibility(username)
 
-    async def broadcast_user(self, username: str, message: dict, *, exclude=None) -> int:
-        """Send a frame to all live device sockets; remove only sockets that failed."""
-        delivered = 0
-        for device in list(self.connections_for(username)):
-            if device is exclude:
-                continue
+    async def _deliver_local_user(self, username: str, message: dict, exclude=None) -> int:
+        """Deliver concurrently to local sockets for `username` with timeout isolation."""
+        targets = [
+            device for device in list(self.connections_for(username))
+            if device is not exclude
+        ]
+        if not targets:
+            return 0
+
+        if len(targets) == 1:
+            device = targets[0]
             try:
-                await device.send_json(message)
-                delivered += 1
+                await scalability_engine.send_json_with_timeout(device, message)
+                self.registry.record_routed_frames(1)
+                return 1
             except Exception:
                 logger.exception("WebSocket broadcast failed: username=%s", username)
+                self.registry.record_broadcast_failure(1)
                 self.disconnect(username, device)
+                return 0
+
+        outcomes = await asyncio.gather(
+            *(scalability_engine.send_json_with_timeout(device, message) for device in targets),
+            return_exceptions=True,
+        )
+        delivered = 0
+        for device, outcome in zip(targets, outcomes):
+            if isinstance(outcome, Exception):
+                logger.error(
+                    "WebSocket broadcast failed: username=%s error=%r",
+                    username,
+                    outcome,
+                )
+                self.registry.record_broadcast_failure(1)
+                self.disconnect(username, device)
+            else:
+                delivered += 1
+        self.registry.record_routed_frames(delivered)
         return delivered
+
+    async def broadcast_user(self, username: str, message: dict, *, exclude=None) -> int:
+        """Send a frame to all live device sockets across subscribed gateway workers."""
+        return await self.broker.publish_user(username, message, exclude=exclude)
+
+    async def broadcast_many_users(
+        self,
+        usernames,
+        message: dict,
+        *,
+        exclude_username: Optional[str] = None,
+    ) -> int:
+        """Broadcast concurrently in bounded batches so slow sockets never stall fan-out."""
+        return await self.broker.publish_many_users(
+            usernames, message, exclude_username=exclude_username
+        )
 
     def disconnect(self, username: str, websocket: Optional[WebSocket] = None):
         # With no socket, keep the previous API behaviour and clear the user's registry.
         if websocket is None:
+            self.registry.unregister(username, None)
             self.active_connections.pop(username, None)
             self.device_connections.pop(username, None)
             self.device_visibility.pop(username, None)
             self.visible.pop(username, None)
             return
 
+        self.registry.unregister(username, websocket)
         devices = [
             device for device in self.device_connections.get(username, [])
             if device is not websocket
@@ -686,14 +765,15 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-# DATA_INTEGRITY_ISSUE_45: ordered per-recipient processing.
-# SQLite persistence and live delivery for one recipient use the same lock, so
-# concurrent senders cannot cause later persisted messages to be sent first.
-recipient_delivery_locks: Dict[str, asyncio.Lock] = {}
+# DATA_INTEGRITY_ISSUE_45 + SCALABILITY_ISSUE_42:
+# Bounded striped lock pool preserves strict per-recipient message ordering while
+# capping lock memory to a fixed stripe count even at 100,000+ concurrent users.
+recipient_lock_pool = scalability_engine.StripedLockPool()
+recipient_delivery_locks = recipient_lock_pool
 
 
 def get_recipient_delivery_lock(recipient: str) -> asyncio.Lock:
-    return recipient_delivery_locks.setdefault(recipient, asyncio.Lock())
+    return recipient_lock_pool.get(recipient)
 
 
 def assert_message_integrity(rows) -> None:
@@ -984,6 +1064,13 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
 
     try:
         await manager.connect(username, websocket)
+    except scalability_engine.CapacityExceededError:
+        logger.warning("Rejected WebSocket connection over capacity: username=%s", username)
+        try:
+            await websocket.close(code=1013, reason="Server at capacity; try again shortly")
+        except Exception:
+            logger.debug("WebSocket capacity rejection close failed", exc_info=True)
+        return
     except Exception:
         logger.exception("Failed to establish WebSocket: username=%s", username)
         try:
@@ -1280,21 +1367,30 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         "id": get_message_row_id(msg_id),
                         "mentioned_users": mentioned_users,
                     }
-                    for member in group_members:
-                        if member != username:
-                            await manager.broadcast_user(member, incoming_frame)
+                    await manager.broadcast_many_users(
+                        group_members, incoming_frame, exclude_username=username
+                    )
 
                     # USER_MENTIONS_WEB_FR25: distinct live event in addition to the group message.
-                    for mentioned_user in mentioned_users:
-                        await manager.broadcast_user(mentioned_user, {
-                            "type": "mention_notification",
-                            "notification_id": notification_id_for(msg_id, mentioned_user),
-                            "msg_id": msg_id,
-                            "group_id": group_id,
-                            "group_name": group["name"],
-                            "sender": username,
-                            "content_preview": content.replace("\n", " ").strip()[:180],
-                        })
+                    if mentioned_users:
+                        content_preview = content.replace("\n", " ").strip()[:180]
+                        await scalability_engine.gather_bounded(
+                            (
+                                lambda target=mentioned_user: manager.broadcast_user(
+                                    target,
+                                    {
+                                        "type": "mention_notification",
+                                        "notification_id": notification_id_for(msg_id, target),
+                                        "msg_id": msg_id,
+                                        "group_id": group_id,
+                                        "group_name": group["name"],
+                                        "sender": username,
+                                        "content_preview": content_preview,
+                                    },
+                                )
+                                for mentioned_user in mentioned_users
+                            )
+                        )
 
             elif message_type == "visibility":
                 manager.set_visibility(username, websocket, bool(data.get("visible")))
@@ -1385,8 +1481,7 @@ async def broadcast_profile(username: str, profile: dict):
     online contact, so the change is visible immediately."""
     targets = {username} | set(profile_service.contacts_of(username))
     frame = {"type": "profile_update", "profile": profile}
-    for name in targets:
-        await manager.broadcast_user(name, frame)
+    await manager.broadcast_many_users(targets, frame)
 
 
 @app.get("/api/profiles")
