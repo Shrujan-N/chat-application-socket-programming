@@ -15,7 +15,7 @@ import sqlite3
 from collections import deque
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Dict, Optional
 from database import init_db as init_core_db, get_db as core_get_db
 from security import (
@@ -82,8 +82,14 @@ class BlockUserSchema(BaseModel):
 class ReportUserSchema(BaseModel):
     username: str = ""
     reason: str = ""
- 
- 
+
+
+class GroupCreateSchema(BaseModel):
+    name: str = ""
+    members: list[str] = Field(default_factory=list)
+    icon: str = "👥"
+
+
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_MINUTES = int(os.environ.get("LOCKOUT_MINUTES", "15"))
 PUBLIC_API_PATHS = {
@@ -795,6 +801,87 @@ def persist_websocket_message(
             except sqlite3.Error:
                 logger.exception("Failed to close message database connection")
 
+def persist_websocket_group_message(
+    msg_id: str,
+    group_id: str,
+    sender: str,
+    content: str,
+    timestamp: str,
+    integrity_hash: Optional[str] = None,
+):
+    """Persist a group message once and reject conflicting retries."""
+    expected_hash = content_sha256(content)
+    if integrity_hash is not None and not verify_content_sha256(content, integrity_hash):
+        raise ValueError("Message content checksum mismatch")
+
+    conn = None
+    try:
+        conn = get_db()
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO messages
+                (msg_id, conversation_type, conversation_id, sender, recipient,
+                 group_id, content, timestamp, status, integrity_hash)
+            VALUES (?, 'group', ?, ?, '', ?, ?, ?, 'sent', ?)
+            """,
+            (msg_id, f"group:{group_id}", sender, group_id, content, timestamp, expected_hash),
+        )
+        inserted = cursor.rowcount == 1
+
+        if not inserted:
+            existing = conn.execute(
+                """
+                SELECT sender, conversation_type, group_id, content, timestamp, integrity_hash
+                FROM messages WHERE msg_id = ?
+                """,
+                (msg_id,),
+            ).fetchone()
+            if existing is None or (
+                existing["sender"] != sender
+                or existing["conversation_type"] != "group"
+                or existing["group_id"] != group_id
+                or existing["content"] != content
+                or existing["timestamp"] != timestamp
+                or not verify_content_sha256(existing["content"], existing["integrity_hash"])
+            ):
+                raise ValueError("Message ID conflicts with an existing message")
+
+        conn.commit()
+        return inserted
+    except Exception:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                logger.exception("Failed to roll back group message transaction")
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def get_group_for_delivery(group_id: str):
+    """Return a group record and its members, or (None, []) when it is missing."""
+    conn = None
+    try:
+        conn = get_db()
+        group = conn.execute(
+            "SELECT group_id, name, icon, creator FROM groups WHERE group_id = ?",
+            (group_id,),
+        ).fetchone()
+        if group is None:
+            return None, []
+        members = conn.execute(
+            "SELECT username FROM group_members WHERE group_id = ? ORDER BY joined_at, username",
+            (group_id,),
+        ).fetchall()
+        return dict(group), [row["username"] for row in members]
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 # --- Reconnection handling (FR-21) helpers ---
 def get_message_row_id(msg_id: str):
     """Database row id of a stored message. Clients use it as a cursor so that,
@@ -1055,6 +1142,120 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                             schedule_push(msg_id, username, recipient, content)
                         except Exception:
                             logger.exception("Failed to schedule push notification: recipient=%s", recipient)
+
+            elif message_type == "send_group_message":
+                delivery_started_at = time.perf_counter()
+                group_id = data.get("group_id")
+                content = data.get("content")
+                msg_id = data.get("msg_id") or os.urandom(16).hex()
+                timestamp = data.get("timestamp")
+
+                if (
+                    not isinstance(group_id, str) or not group_id.strip()
+                    or not isinstance(content, str) or not content.strip()
+                    or not isinstance(msg_id, str) or not msg_id.strip()
+                    or not isinstance(timestamp, str) or not timestamp.strip()
+                ):
+                    await websocket.send_json({"type": "error", "message": "Invalid group message fields."})
+                    continue
+
+                group_id = group_id.strip()
+                msg_id = msg_id.strip()
+                group, group_members = get_group_for_delivery(group_id)
+                if group is None or username not in group_members:
+                    await websocket.send_json({
+                        "type": "error",
+                        "msg_id": msg_id,
+                        "message": "Group not found or you are no longer a member.",
+                    })
+                    continue
+
+                provided_integrity_hash = data.get("integrity_hash")
+                if provided_integrity_hash is not None and not verify_content_sha256(
+                    content, provided_integrity_hash
+                ):
+                    await websocket.send_json({
+                        "type": "error",
+                        "msg_id": msg_id,
+                        "message": "Message integrity verification failed; message was not sent.",
+                    })
+                    continue
+
+                async with get_recipient_delivery_lock(f"group:{group_id}"):
+                    try:
+                        inserted = persist_websocket_group_message(
+                            msg_id, group_id, username, content, timestamp,
+                            provided_integrity_hash,
+                        )
+                    except ValueError:
+                        await websocket.send_json({
+                            "type": "error",
+                            "msg_id": msg_id,
+                            "message": "Message ID conflicts with an existing message.",
+                        })
+                        continue
+                    except sqlite3.Error:
+                        await websocket.send_json({
+                            "type": "error",
+                            "msg_id": msg_id,
+                            "message": "Group message could not be saved. Please retry.",
+                            "retryable": True,
+                        })
+                        continue
+                    except Exception:
+                        logger.exception(
+                            "Unexpected group message-processing failure: username=%s group_id=%s",
+                            username, group_id,
+                        )
+                        await websocket.send_json({
+                            "type": "error",
+                            "msg_id": msg_id,
+                            "message": "Group message processing failed. Please retry.",
+                            "retryable": True,
+                        })
+                        continue
+
+                    if inserted:
+                        frame = {
+                            "type": "message_sync",
+                            "msg_id": msg_id,
+                            "sender": username,
+                            "recipient": None,
+                            "group_id": group_id,
+                            "conversation_type": "group",
+                            "group_name": group["name"],
+                            "content": content,
+                            "timestamp": timestamp,
+                            "status": "sent",
+                            "integrity_hash": content_sha256(content),
+                            "id": get_message_row_id(msg_id),
+                        }
+                        await manager.broadcast_user(username, frame, exclude=websocket)
+
+                    await manager.broadcast_user(username, {
+                        "type": "status_update", "msg_id": msg_id, "status": "sent"
+                    })
+
+                    # A duplicate retry is already persisted and must not be forwarded twice.
+                    if not inserted:
+                        continue
+
+                    incoming_frame = {
+                        "type": "receive_message",
+                        "msg_id": msg_id,
+                        "sender": username,
+                        "recipient": None,
+                        "group_id": group_id,
+                        "conversation_type": "group",
+                        "group_name": group["name"],
+                        "content": content,
+                        "timestamp": timestamp,
+                        "integrity_hash": content_sha256(content),
+                        "id": get_message_row_id(msg_id),
+                    }
+                    for member in group_members:
+                        if member != username:
+                            await manager.broadcast_user(member, incoming_frame)
 
             elif message_type == "visibility":
                 manager.set_visibility(username, websocket, bool(data.get("visible")))
@@ -1531,6 +1732,167 @@ async def remove_contact(payload: RemoveContactSchema):
     conn.close()
     return {"success": True, "message": f"Removed '{payload.contact_username}' from contacts"}
  
+# --- Group chat API (web UI) ---
+def require_group_membership(conn, group_id: str, username: str):
+    group = conn.execute(
+        "SELECT group_id, name, icon, creator, created_at FROM groups WHERE group_id = ?",
+        (group_id,),
+    ).fetchone()
+    if group is None:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    membership = conn.execute(
+        "SELECT role FROM group_members WHERE group_id = ? AND username = ?",
+        (group_id, username),
+    ).fetchone()
+    if membership is None:
+        raise HTTPException(status_code=403, detail="You are not a member of this group")
+    return dict(group), membership["role"]
+
+
+@app.post("/api/groups")
+async def create_group(payload: GroupCreateSchema, request: Request):
+    creator = current_username(request)
+    name = payload.name.strip()
+    icon = (payload.icon or "👥").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Group name is required")
+    if len(name) > 80:
+        raise HTTPException(status_code=400, detail="Group name must be 80 characters or fewer")
+    if not icon or len(icon) > 16:
+        raise HTTPException(status_code=400, detail="Choose a valid group icon")
+
+    members = []
+    for value in payload.members:
+        member = value.strip() if isinstance(value, str) else ""
+        if member and member != creator and member not in members:
+            members.append(member)
+    if not members:
+        raise HTTPException(status_code=400, detail="Choose at least one other member")
+    if len(members) > 100:
+        raise HTTPException(status_code=400, detail="A group can have at most 100 invited members")
+
+    conn = get_db()
+    try:
+        placeholders = ",".join("?" for _ in members)
+        rows = conn.execute(
+            f"SELECT username FROM users WHERE username IN ({placeholders})", members
+        ).fetchall()
+        found = {row["username"] for row in rows}
+        missing = [member for member in members if member not in found]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail="Unknown group member(s): " + ", ".join(missing),
+            )
+
+        group_id = "grp-" + uuid.uuid4().hex
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO groups (group_id, name, icon, creator) VALUES (?, ?, ?, ?)",
+            (group_id, name, icon, creator),
+        )
+        conn.execute(
+            "INSERT INTO group_members (group_id, username, role) VALUES (?, ?, 'admin')",
+            (group_id, creator),
+        )
+        conn.executemany(
+            "INSERT INTO group_members (group_id, username, role) VALUES (?, ?, 'member')",
+            [(group_id, member) for member in members],
+        )
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except sqlite3.IntegrityError as error:
+        conn.rollback()
+        logger.exception("Could not create group for username=%s", creator)
+        raise HTTPException(status_code=409, detail="Could not create the group") from error
+    finally:
+        conn.close()
+
+    return {
+        "success": True,
+        "group": {
+            "group_id": group_id,
+            "name": name,
+            "icon": icon,
+            "creator": creator,
+            "member_count": len(members) + 1,
+        },
+    }
+
+
+@app.get("/api/groups")
+async def list_my_groups(request: Request):
+    username = current_username(request)
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT g.group_id, g.name, g.icon, g.creator, g.created_at,
+                   COUNT(all_members.username) AS member_count
+            FROM groups AS g
+            JOIN group_members AS mine ON mine.group_id = g.group_id
+            JOIN group_members AS all_members ON all_members.group_id = g.group_id
+            WHERE mine.username = ?
+            GROUP BY g.group_id
+            ORDER BY g.created_at DESC, g.name COLLATE NOCASE
+            """,
+            (username,),
+        ).fetchall()
+        return {"groups": [dict(row) for row in rows]}
+    finally:
+        conn.close()
+
+
+@app.get("/api/groups/{group_id}/members")
+async def get_group_members(group_id: str, request: Request):
+    username = current_username(request)
+    conn = get_db()
+    try:
+        require_group_membership(conn, group_id, username)
+        rows = conn.execute(
+            """
+            SELECT username, role, joined_at
+            FROM group_members WHERE group_id = ?
+            ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, joined_at, username
+            """,
+            (group_id,),
+        ).fetchall()
+        return {"members": [dict(row) for row in rows]}
+    finally:
+        conn.close()
+
+
+@app.get("/api/groups/{group_id}/history")
+async def get_group_history(group_id: str, request: Request):
+    username = current_username(request)
+    conn = get_db()
+    try:
+        group, _ = require_group_membership(conn, group_id, username)
+        rows = conn.execute(
+            """
+            SELECT rowid AS id, msg_id, sender, content, timestamp, status,
+                   integrity_hash, reply_to_msg_id, group_id, conversation_type
+            FROM messages
+            WHERE conversation_type = 'group' AND group_id = ?
+            ORDER BY rowid ASC
+            """,
+            (group_id,),
+        ).fetchall()
+        assert_message_integrity(rows)
+        history = []
+        for row in rows:
+            item = dict(row)
+            item.pop("integrity_hash", None)
+            item["reply_preview"] = None
+            history.append(item)
+        return {"group": group, "history": history}
+    finally:
+        conn.close()
+
+
 # --- Fetch Conversation History Endpoint (ADDED FOR ISSUE #23) ---
 @app.get("/api/messages/history/{user1}/{user2}")
 async def get_chat_history(user1: str, user2: str):
@@ -1574,20 +1936,35 @@ async def sync_missed_messages(request: Request, since: int = -1):
     conn = get_db()
     try:
         latest = conn.execute(
-            "SELECT COALESCE(MAX(rowid), 0) FROM messages WHERE recipient = ?", (username,)
+            """
+            SELECT COALESCE(MAX(rowid), 0) FROM messages
+            WHERE recipient = ? OR (
+                conversation_type = 'group'
+                AND group_id IN (SELECT group_id FROM group_members WHERE username = ?)
+            )
+            """,
+            (username, username),
         ).fetchone()[0]
         if since < 0:
             return {"messages": [], "latest_id": latest, "has_more": False}
 
         rows = conn.execute(
             """
-            SELECT rowid AS id, msg_id, sender, recipient, content, timestamp, status, integrity_hash, reply_to_msg_id
+            SELECT rowid AS id, msg_id, sender, recipient, content, timestamp, status,
+                   integrity_hash, reply_to_msg_id, group_id, conversation_type
             FROM messages
             WHERE recipient = ? AND rowid > ?
-            ORDER BY rowid ASC
+            UNION ALL
+            SELECT rowid AS id, msg_id, sender, recipient, content, timestamp, status,
+                   integrity_hash, reply_to_msg_id, group_id, conversation_type
+            FROM messages
+            WHERE conversation_type = 'group'
+              AND group_id IN (SELECT group_id FROM group_members WHERE username = ?)
+              AND rowid > ?
+            ORDER BY id ASC
             LIMIT ?
             """,
-            (username, since, SYNC_PAGE_LIMIT),
+            (username, since, username, since, SYNC_PAGE_LIMIT),
         ).fetchall()
         assert_message_integrity(rows)
         messages = [dict(row) for row in rows]
@@ -1597,7 +1974,10 @@ async def sync_missed_messages(request: Request, since: int = -1):
                 message.get("reply_to_msg_id"), message["sender"], message["recipient"]
             )
 
-        newly_delivered = [m for m in messages if m["status"] == "sent"]
+        newly_delivered = [
+            m for m in messages
+            if m["status"] == "sent" and m.get("conversation_type") != "group"
+        ]
         if newly_delivered:
             conn.executemany(
                 "UPDATE messages SET status = 'delivered' WHERE rowid = ? AND status = 'sent'",
