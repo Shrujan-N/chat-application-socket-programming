@@ -52,6 +52,16 @@
         .search-box { padding: 10px; background: #1a2332; border-bottom: 1px solid #2e3b52; }
         #add-contact-dialog { width: min(400px, calc(100% - 32px)); margin: auto; padding: 20px; border: 1px solid #2e3b52; border-radius: 8px; background: #1a2332; color: #fff; }
         #add-contact-dialog::backdrop { background: rgba(0, 0, 0, 0.7); }
+        #create-group-dialog { width: min(460px, calc(100% - 32px)); max-height: 88vh; overflow-y: auto; margin: auto; padding: 20px; border: 1px solid #2e3b52; border-radius: 8px; background: #1a2332; color: #fff; }
+        #create-group-dialog::backdrop { background: rgba(0, 0, 0, 0.7); }
+        #create-group-form { display: flex; flex-direction: column; gap: 10px; }
+        #create-group-form input[type="text"], #create-group-form input[type="search"] { width: 100%; min-width: 0; padding: 10px; border: 1px solid #2e3b52; border-radius: 6px; background: #0f141d; color: #fff; }
+        #group-member-options { max-height: 230px; }
+        .group-member-option { display: flex; align-items: center; justify-content: flex-start; gap: 10px; padding: 9px 10px; border-bottom: 1px solid #232d3f; cursor: pointer; font-size: 13px; }
+        .group-member-option:last-child { border-bottom: 0; }
+        .group-member-option input { flex: none; width: 16px; height: 16px; }
+        #create-group-error { color: #ff8080; font-size: 13px; }
+        #create-group-actions { display: flex; justify-content: flex-end; gap: 8px; }
         #add-contact-form { display: flex; flex-direction: column; gap: 12px; }
         #add-contact-form input { padding: 10px; border: 1px solid #2e3b52; border-radius: 6px; background: #0f141d; color: #fff; }
         #add-contact-actions { display: flex; justify-content: flex-end; gap: 8px; }
@@ -361,7 +371,10 @@
                 <button onclick="openProfileDialog()" style="padding: 4px 8px; font-size: 11px;">Profile</button>
                 <button onclick="logout()" style="padding: 4px 8px; font-size: 11px; background: #dc3545;">Logout</button>
             </div>
-            <button onclick="openAddContactDialog()" style="padding: 5px 10px; font-size: 12px; background: #28a745;">+ Add</button>
+            <div style="display:flex; gap:6px; align-items:center;">
+                <button type="button" onclick="openCreateGroupDialog()" style="padding: 5px 9px; font-size: 12px; background: #596579;">+ Group</button>
+                <button type="button" onclick="openAddContactDialog()" style="padding: 5px 10px; font-size: 12px; background: #28a745;">+ Add</button>
+            </div>
         </div>
         <div id="push-bar" hidden>
             <span id="push-status"></span>
@@ -417,6 +430,27 @@
             <div id="add-contact-actions">
                 <button type="button" onclick="closeAddContactDialog()">Cancel</button>
                 <button id="add-contact-submit" type="submit" style="background:#28a745;">Add</button>
+            </div>
+        </form>
+    </dialog>
+
+    <dialog id="create-group-dialog" aria-labelledby="create-group-title">
+        <form id="create-group-form" onsubmit="createGroup(event)">
+            <h2 id="create-group-title">Create a group chat</h2>
+            <p class="hint">Choose a name and at least one other registered user.</p>
+            <label for="group-name-input">Group name</label>
+            <input id="group-name-input" type="text" maxlength="80" required autocomplete="off" placeholder="e.g. Project Team">
+            <label for="group-icon-input">Group icon (optional)</label>
+            <input id="group-icon-input" type="text" maxlength="16" value="👥" autocomplete="off" aria-label="Group icon">
+            <label for="group-member-search">Select members</label>
+            <input id="group-member-search" type="search" autocomplete="off" placeholder="Filter registered users…" oninput="renderGroupMemberOptions()">
+            <div id="group-member-options" class="user-results" role="group" aria-label="Group members">
+                <div class="user-result-empty">Loading registered users…</div>
+            </div>
+            <p id="create-group-error" role="alert" hidden></p>
+            <div id="create-group-actions">
+                <button type="button" onclick="closeCreateGroupDialog()" style="background:#374151;">Cancel</button>
+                <button id="create-group-submit" type="submit" style="background:#28a745;">Create group</button>
             </div>
         </form>
     </dialog>
@@ -477,6 +511,10 @@
     <script>
         let currentUser = null;
         let activeContact = null;
+        let activeGroupId = null;
+        let activeGroup = null;
+        let lastGroups = [];
+        let groupMemberCandidates = [];
         let ws = null;
         let replyingTo = null;
         const renderedMessages = new Map();
@@ -582,15 +620,17 @@
             }
             if (!isRetry) rememberPerformanceSendStart(message.msg_id);
             try {
+                const isGroupMessage = Boolean(message.group_id);
                 ws.send(JSON.stringify({
-                    type: 'send_message',
+                    type: isGroupMessage ? 'send_group_message' : 'send_message',
                     msg_id: message.msg_id,
                     sender: currentUser,
-                    recipient: message.recipient,
+                    recipient: isGroupMessage ? undefined : message.recipient,
+                    group_id: isGroupMessage ? message.group_id : undefined,
                     content: message.content,
                     timestamp: message.timestamp,
                     integrity_hash: message.integrity_hash,
-                    reply_to_msg_id: message.reply_to_msg_id || null
+                    reply_to_msg_id: isGroupMessage ? null : (message.reply_to_msg_id || null)
                 }));
                 setMessageStatus(message.msg_id, '…', isRetry ? 'Retrying; waiting for server status' : 'Waiting for server status');
                 return true;
@@ -853,9 +893,15 @@
                     (data.messages || []).forEach(msg => {
                         noteSeenId(msg.id);
                         if (recentLiveIds.has(msg.msg_id)) return;   // already received live
+                        if (msg.group_id && msg.sender === currentUser) {
+                            if (activeGroupId === msg.group_id) activeChatAffected = true;
+                            return; // group history includes our own messages; do not announce them as new arrivals
+                        }
                         total += 1;
                         perSender[msg.sender] = (perSender[msg.sender] || 0) + 1;
-                        if (activeContact === msg.sender) {
+                        if (msg.group_id && activeGroupId === msg.group_id) {
+                            activeChatAffected = true;
+                        } else if (!msg.group_id && activeContact === msg.sender) {
                             activeChatAffected = true;
                             if (wsOpen()) {
                                 try {
@@ -884,7 +930,7 @@
             if (afterOutage) {
                 loadContacts().catch(() => {});                 // refresh contacts and pending requests
             }
-            if ((afterOutage || activeChatAffected) && activeContact) {
+            if ((afterOutage || activeChatAffected) && (activeContact || activeGroupId)) {
                 loadHistory();                                   // shows missed messages and current statuses
             }
         }
@@ -1198,7 +1244,9 @@
             document.getElementById('auth-screen').hidden = true;
             document.getElementById('current-user-label').textContent = currentUser;
             activeContact = null;
-            document.getElementById('chat-header').innerText = 'Select a contact to begin messaging';
+            activeGroupId = null;
+            activeGroup = null;
+            document.getElementById('chat-header').innerText = 'Select a contact or group to begin messaging';
             document.getElementById('messages-list').innerHTML = '';
             lastActivity = Date.now();
             resetConnectionState();
@@ -1222,6 +1270,9 @@
             authToken = null;
             currentUser = null;
             activeContact = null;
+            activeGroupId = null;
+            activeGroup = null;
+            lastGroups = [];
             storeToken(null);
             profileCache = {};
             lastContacts = [];
@@ -1590,13 +1641,23 @@
         }
 
         function updateChatHeader() {
-            if (!activeContact) return;
+            const header = document.getElementById('chat-header');
+            if (activeGroup) {
+                const icon = activeGroup.icon || '👥';
+                const count = activeGroup.member_count || (activeGroup.members || []).length || 0;
+                header.textContent = `${icon} ${activeGroup.name} · ${count} members`;
+                return;
+            }
+            if (!activeContact) {
+                header.textContent = 'Select a contact or group to begin messaging';
+                return;
+            }
             const profile = profileFor(activeContact);
             let text = `Chatting with: ${profile.display_name}`;
             if (profile.display_name !== activeContact) text += ` (@${activeContact})`;
             if (profile.bio) text += ` - ${profile.bio}`;
             if (mutedUsers.has(activeContact)) text += ' 🔕 (muted)';
-            document.getElementById('chat-header').innerText = text;
+            header.innerText = text;
         }
 
         async function sendJson(method, url, body) {
@@ -1851,10 +1912,11 @@
  
         async function loadContacts() {
             loadPendingRequests(); // Load pending requests concurrently
-            
+
             const response = await fetch(`/api/contacts/${currentUser}`);
             const data = await response.json();
             lastContacts = data.contacts || [];
+            await loadGroups();
 
             // Profiles (display name, status, picture) for contacts and for me.
             await loadProfiles([...lastContacts, currentUser]);
@@ -1864,15 +1926,70 @@
             updateOnboardingGuide();
         }
 
+        async function loadGroups() {
+            try {
+                const response = await fetch('/api/groups');
+                const data = await readJsonResult(response);
+                lastGroups = data.groups || [];
+                if (activeGroupId) {
+                    activeGroup = lastGroups.find(group => group.group_id === activeGroupId) || activeGroup;
+                }
+            } catch (error) {
+                console.warn('Could not load group chats:', error);
+                lastGroups = [];
+            }
+        }
+
         function renderContactsList() {
             const listElement = document.getElementById('contacts-list');
             listElement.innerHTML = '';
-            
-            if (lastContacts.length === 0) {
-                listElement.innerHTML = '<div style="padding:10px; color:#8696a0; font-size:12px;">No contacts found. Click "+ Add" above to add contacts.</div>';
-                return;
+
+            const groupsHeading = document.createElement('div');
+            groupsHeading.textContent = `GROUP CHATS (${lastGroups.length})`;
+            groupsHeading.style.cssText = 'padding:6px 10px; margin-bottom:6px; font-size:11px; font-weight:bold; letter-spacing:.5px; color:#8fd3f4; background:#1e293b; border-radius:4px;';
+            listElement.appendChild(groupsHeading);
+
+            if (lastGroups.length === 0) {
+                const noGroups = document.createElement('div');
+                noGroups.textContent = 'No groups yet. Use “+ Group” to start one.';
+                noGroups.style.cssText = 'padding:4px 8px 12px; color:#8696a0; font-size:12px;';
+                listElement.appendChild(noGroups);
             }
- 
+
+            lastGroups.forEach(group => {
+                const item = document.createElement('div');
+                item.className = `contact-item ${activeGroupId === group.group_id ? 'active' : ''}`;
+                item.style.cssText = 'display:flex; align-items:center; gap:10px;';
+                const icon = document.createElement('span');
+                icon.textContent = group.icon || '👥';
+                icon.style.fontSize = '25px';
+                const details = document.createElement('span');
+                details.className = 'contact-text';
+                details.style.flex = '1';
+                const title = document.createElement('span');
+                title.className = 'contact-name';
+                title.textContent = group.name;
+                const subtitle = document.createElement('span');
+                subtitle.className = 'contact-bio';
+                subtitle.textContent = `${group.member_count || 0} members`;
+                details.append(title, subtitle);
+                item.append(icon, details);
+                item.addEventListener('click', () => selectGroup(group));
+                listElement.appendChild(item);
+            });
+
+            const contactsHeading = document.createElement('div');
+            contactsHeading.textContent = `CONTACTS (${lastContacts.length})`;
+            contactsHeading.style.cssText = 'padding:6px 10px; margin:10px 0 6px; font-size:11px; font-weight:bold; letter-spacing:.5px; color:#b7c4d8; background:#1e293b; border-radius:4px;';
+            listElement.appendChild(contactsHeading);
+
+            if (lastContacts.length === 0) {
+                const noContacts = document.createElement('div');
+                noContacts.textContent = 'No contacts found. Click “+ Add” to add contacts.';
+                noContacts.style.cssText = 'padding:10px; color:#8696a0; font-size:12px;';
+                listElement.appendChild(noContacts);
+            }
+
             lastContacts.forEach(contact => {
                 const profile = profileFor(contact);
                 const item = document.createElement('div');
@@ -1898,6 +2015,119 @@
             });
         }
  
+        async function openCreateGroupDialog() {
+            const dialog = document.getElementById('create-group-dialog');
+            setText('create-group-error', '');
+            document.getElementById('group-name-input').value = '';
+            document.getElementById('group-icon-input').value = '👥';
+            document.getElementById('group-member-search').value = '';
+            try {
+                await loadGroupMemberCandidates();
+                dialog.showModal();
+                document.getElementById('group-name-input').focus();
+            } catch (error) {
+                setText('create-group-error', error.message || 'Could not load registered users.');
+            }
+        }
+
+        function closeCreateGroupDialog() {
+            document.getElementById('create-group-dialog').close();
+        }
+
+        async function loadGroupMemberCandidates() {
+            const options = document.getElementById('group-member-options');
+            options.innerHTML = '<div class="user-result-empty">Loading registered users…</div>';
+            const response = await fetch('/api/users');
+            const data = await readJsonResult(response);
+            groupMemberCandidates = (data.users || [])
+                .filter(username => username && username !== currentUser)
+                .sort((first, second) => first.localeCompare(second));
+            renderGroupMemberOptions();
+        }
+
+        function renderGroupMemberOptions() {
+            const options = document.getElementById('group-member-options');
+            if (!options) return;
+            const query = document.getElementById('group-member-search').value.trim().toLowerCase();
+            const matches = groupMemberCandidates.filter(username => username.toLowerCase().includes(query));
+            options.replaceChildren();
+            if (!matches.length) {
+                const empty = document.createElement('div');
+                empty.className = 'user-result-empty';
+                empty.textContent = 'No registered users match this filter.';
+                options.appendChild(empty);
+                return;
+            }
+            matches.forEach(username => {
+                const row = document.createElement('label');
+                row.className = 'group-member-option';
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.value = username;
+                checkbox.setAttribute('aria-label', 'Add @' + username + ' to group');
+                const name = document.createElement('span');
+                name.textContent = '@' + username;
+                row.append(checkbox, name);
+                options.appendChild(row);
+            });
+        }
+
+        async function createGroup(event) {
+            event.preventDefault();
+            const button = document.getElementById('create-group-submit');
+            setText('create-group-error', '');
+            const name = document.getElementById('group-name-input').value.trim();
+            const icon = document.getElementById('group-icon-input').value.trim() || '👥';
+            const members = [...document.querySelectorAll('#group-member-options input[type="checkbox"]:checked')]
+                .map(input => input.value);
+            if (!name) {
+                setText('create-group-error', 'Enter a group name.');
+                return;
+            }
+            if (!members.length) {
+                setText('create-group-error', 'Select at least one other member.');
+                return;
+            }
+            button.disabled = true;
+            try {
+                const result = await sendJson('POST', '/api/groups', { name, icon, members });
+                closeCreateGroupDialog();
+                await loadContacts();
+                selectGroup(result.group);
+                showToast(`Group “${result.group.name}” created.`);
+            } catch (error) {
+                setText('create-group-error', error.message || 'Could not create the group.');
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        function selectGroup(group) {
+            if (!group || !group.group_id) return;
+            if (activeGroupId !== group.group_id) cancelReply();
+            activeContact = null;
+            activeGroupId = group.group_id;
+            activeGroup = lastGroups.find(item => item.group_id === group.group_id) || group;
+            if (window.matchMedia && window.matchMedia('(max-width: 700px)').matches) {
+                document.body.classList.add('mobile-chat-open');
+            } else {
+                document.body.classList.remove('mobile-chat-open');
+            }
+            updateChatHeader();
+            renderContactsList();
+            loadHistory();
+            fetch(`/api/groups/${encodeURIComponent(group.group_id)}/members`)
+                .then(readJsonResult)
+                .then(data => {
+                    if (activeGroupId === group.group_id && activeGroup) {
+                        activeGroup.members = data.members || [];
+                        activeGroup.member_count = activeGroup.members.length;
+                        updateChatHeader();
+                    }
+                })
+                .catch(error => console.warn('Could not load group members:', error));
+        }
+
         async function loadPendingRequests() {
             const response = await fetch(`/api/contacts/pending/${currentUser}`);
             const data = await response.json();
@@ -1953,8 +2183,10 @@
         }
 
         function selectContact(contact) {
-            if (activeContact !== contact) cancelReply();
+            if (activeContact !== contact || activeGroupId) cancelReply();
             activeContact = contact;
+            activeGroupId = null;
+            activeGroup = null;
             if (window.matchMedia && window.matchMedia('(max-width: 700px)').matches) {
                 document.body.classList.add('mobile-chat-open');
             } else {
@@ -1968,18 +2200,20 @@
  
         // --- Fetch Chat History from SQLite (ADDED FOR ISSUE #23) ---
         async function loadHistory() {
-            if (!activeContact) return;
+            if (!activeContact && !activeGroupId) return;
             const contactAtRequest = activeContact;
+            const groupIdAtRequest = activeGroupId;
 
             try {
-                const response = await fetch(
-                    `/api/messages/history/${encodeURIComponent(currentUser)}/${encodeURIComponent(contactAtRequest)}`
-                );
+                const url = groupIdAtRequest
+                    ? `/api/groups/${encodeURIComponent(groupIdAtRequest)}/history`
+                    : `/api/messages/history/${encodeURIComponent(currentUser)}/${encodeURIComponent(contactAtRequest)}`;
+                const response = await fetch(url);
                 if (!response.ok) {
                     throw new Error(`History request failed (HTTP ${response.status})`);
                 }
                 const data = await response.json();
-                if (activeContact !== contactAtRequest) return;
+                if (activeContact !== contactAtRequest || activeGroupId !== groupIdAtRequest) return;
 
                 const list = document.getElementById('messages-list');
                 list.innerHTML = '';
@@ -1992,7 +2226,7 @@
 
                 // Keep queued messages visible after refresh until the server acknowledges them.
                 readOutbox()
-                    .filter(msg => msg.recipient === contactAtRequest && !knownIds.has(msg.msg_id))
+                    .filter(msg => (groupIdAtRequest ? msg.group_id === groupIdAtRequest : (!msg.group_id && msg.recipient === contactAtRequest)) && !knownIds.has(msg.msg_id))
                     .forEach(msg => {
                         appendMessageUI(currentUser, msg.content, msg.timestamp, 'sending', msg.msg_id, msg.reply_preview);
                         setMessageStatus(msg.msg_id, '…', 'Queued; waiting for server confirmation');
@@ -2043,7 +2277,9 @@
                 if (data.sender !== currentUser || !data.msg_id) return;
                 noteSeenId(data.id);
                 rememberLiveId(data.msg_id);
-                if (activeContact === data.recipient) {
+                if (data.group_id && activeGroupId === data.group_id) {
+                    appendMessageUI(currentUser, data.content, data.timestamp, data.status || 'sent', data.msg_id);
+                } else if (!data.group_id && activeContact === data.recipient) {
                     appendMessageUI(currentUser, data.content, data.timestamp, data.status || 'sent', data.msg_id);
                 }
                 return;
@@ -2051,7 +2287,15 @@
             if (data.type === "receive_message") {
                 noteSeenId(data.id);
                 rememberLiveId(data.msg_id);
-                // ACK only after incoming content passed checksum verification.
+                if (data.group_id) {
+                    if (activeGroupId === data.group_id) {
+                        appendMessageUI(data.sender, data.content, data.timestamp, 'delivered', data.msg_id);
+                    } else {
+                        showToast(`New message in ${data.group_name || 'a group chat'} from @${data.sender}.`);
+                    }
+                    return;
+                }
+                // ACK only after incoming private-message content passed checksum verification.
                 if (wsOpen()) {
                     try {
                         ws.send(JSON.stringify({ type: "delivery_ack", msg_id: data.msg_id }));
@@ -2216,11 +2460,11 @@
             const input = document.getElementById('message-input');
             const content = input.value.trim();
 
-            if (!content || !activeContact) {
-                if (!activeContact) alert('Please select a contact first!');
+            if (!content || (!activeContact && !activeGroupId)) {
+                if (!activeContact && !activeGroupId) alert('Please select a contact or group first!');
                 return;
             }
-            if (blockedUsers.has(activeContact)) {
+            if (activeContact && blockedUsers.has(activeContact)) {
                 alert(`You have blocked @${activeContact}. Unblock them before sending a message.`);
                 return;
             }
@@ -2228,12 +2472,14 @@
             const msgId = 'msg-' + (window.crypto && crypto.randomUUID
                 ? crypto.randomUUID()
                 : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
-            const reply = replyingTo ? { ...replyingTo } : null;
+            const groupIdAtSend = activeGroupId;
+            const reply = groupIdAtSend ? null : (replyingTo ? { ...replyingTo } : null);
             const payload = {
-                type: 'send_message',
+                type: groupIdAtSend ? 'send_group_message' : 'send_message',
                 msg_id: msgId,
                 sender: currentUser,
-                recipient: activeContact,
+                recipient: groupIdAtSend ? undefined : activeContact,
+                group_id: groupIdAtSend || undefined,
                 content: content,
                 timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
                 reply_to_msg_id: reply ? reply.msg_id : null,
@@ -2372,6 +2618,14 @@
                 statusHTML = `<span class="message-status${readClass}" id="status-${msgId}" title="${title}">${label}</span>`;
             }
             const body = document.createElement('div');
+            if (activeGroupId && sender !== currentUser) {
+                const senderLabel = document.createElement('div');
+                senderLabel.textContent = displayNameOf(sender) === sender
+                    ? `@${sender}`
+                    : `${displayNameOf(sender)} (@${sender})`;
+                senderLabel.style.cssText = 'font-size:11px;font-weight:700;color:#8fd3f4;margin-bottom:5px;';
+                body.appendChild(senderLabel);
+            }
             const quote = createReplyQuote(replyPreview);
             if (quote) body.appendChild(quote);
             const contentElement = document.createElement('div');
@@ -2384,7 +2638,7 @@
             footer.innerHTML = `${timeStr} ${statusHTML}`;
             msgDiv.appendChild(footer);
 
-            if (msgId) {
+            if (msgId && !activeGroupId) {
                 const actionRow = document.createElement('div');
                 actionRow.className = 'message-action-row';
                 const replyButton = document.createElement('button');
@@ -2411,11 +2665,11 @@
         let gifSearchVersion = 0;
 
         async function openGifPicker(kind = 'gif') {
-            if (!activeContact) {
-                alert('Please select a contact before sending a GIF or sticker.');
+            if (!activeContact && !activeGroupId) {
+                alert('Please select a contact or group before sending a GIF or sticker.');
                 return;
             }
-            if (blockedUsers.has(activeContact)) {
+            if (activeContact && blockedUsers.has(activeContact)) {
                 alert(`You have blocked @${activeContact}. Unblock them before sending a GIF or sticker.`);
                 return;
             }
@@ -2566,10 +2820,11 @@
                 : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
             const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
             const payload = {
-                type: 'send_message',
+                type: activeGroupId ? 'send_group_message' : 'send_message',
                 msg_id: msgId,
                 sender: currentUser,
-                recipient: activeContact,
+                recipient: activeGroupId ? undefined : activeContact,
+                group_id: activeGroupId || undefined,
                 content,
                 timestamp
             };
@@ -2616,6 +2871,7 @@
         let activeVoiceStream = null;
         let voiceRecordingChunks = [];
         let voiceRecordingRecipient = null;
+        let voiceRecordingGroupId = null;
         let voiceRecordingStartedAt = 0;
         let voiceRecordingTimer = null;
         let voiceUploadBusy = false;
@@ -2651,8 +2907,8 @@
                 activeVoiceRecorder.stop();
                 return;
             }
-            if (!activeContact) {
-                alert('Please select a contact before recording a voice message.');
+            if (!activeContact && !activeGroupId) {
+                alert('Please select a contact or group before recording a voice message.');
                 return;
             }
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === 'undefined') {
@@ -2671,6 +2927,7 @@
                 activeVoiceRecorder = recorder;
                 voiceRecordingChunks = [];
                 voiceRecordingRecipient = activeContact;
+                voiceRecordingGroupId = activeGroupId;
                 voiceRecordingStartedAt = Date.now();
 
                 recorder.addEventListener('dataavailable', event => {
@@ -2682,10 +2939,12 @@
                 recorder.addEventListener('stop', async () => {
                     const chunks = voiceRecordingChunks;
                     const recipient = voiceRecordingRecipient;
+                    const groupId = voiceRecordingGroupId;
                     const elapsed = Date.now() - voiceRecordingStartedAt;
                     const recordedType = (recorder.mimeType || (chunks[0] && chunks[0].type) || 'audio/webm').split(';', 1)[0].toLowerCase();
                     voiceRecordingChunks = [];
                     voiceRecordingRecipient = null;
+                    voiceRecordingGroupId = null;
                     if (voiceRecordingTimer) clearTimeout(voiceRecordingTimer);
                     voiceRecordingTimer = null;
                     stopVoiceStream();
@@ -2710,8 +2969,8 @@
                         setVoiceRecordStatus('The voice message is over 5 MB. Please record a shorter clip.');
                         return;
                     }
-                    if (!recipient) {
-                        setVoiceRecordStatus('No recipient was selected for this recording. Please try again.');
+                    if (!recipient && !groupId) {
+                        setVoiceRecordStatus('No conversation was selected for this recording. Please try again.');
                         return;
                     }
 
@@ -2719,7 +2978,7 @@
                     document.getElementById('voice-record-button').disabled = true;
                     setVoiceRecordStatus('Uploading voice message…');
                     try {
-                        await uploadAndSendVoiceMessage(blob, recordedType, extension, recipient);
+                        await uploadAndSendVoiceMessage(blob, recordedType, extension, recipient, groupId);
                         setVoiceRecordStatus('Voice message sent.');
                     } catch (error) {
                         console.error('Voice message upload failed:', error);
@@ -2756,7 +3015,7 @@
             }
         }
 
-        async function uploadAndSendVoiceMessage(blob, mimeType, extension, recipient) {
+        async function uploadAndSendVoiceMessage(blob, mimeType, extension, recipient, groupId = null) {
             const form = new FormData();
             form.append('file', blob, `voice-message.${extension}`);
             const response = await window.fetch('/api/voice-messages/upload', { method: 'POST', body: form });
@@ -2772,16 +3031,17 @@
                 ? crypto.randomUUID()
                 : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
             const payload = {
-                type: 'send_message',
+                type: groupId ? 'send_group_message' : 'send_message',
                 msg_id: msgId,
                 sender: currentUser,
-                recipient,
+                recipient: groupId ? undefined : recipient,
+                group_id: groupId || undefined,
                 content: audioMarkup,
                 timestamp: timeStr
             };
 
             queueOutgoingMessage(payload);
-            if (activeContact === recipient) {
+            if ((groupId && activeGroupId === groupId) || (!groupId && activeContact === recipient)) {
                 appendMessageUI(currentUser, audioMarkup, timeStr, 'sending', msgId);
                 setMessageStatus(msgId, '…', 'Waiting for server status');
             }
@@ -2796,7 +3056,9 @@
                     }
                 }
             } else {
-                if (activeContact === recipient) setMessageStatus(msgId, '…', 'Queued; waiting for connection');
+                if ((groupId && activeGroupId === groupId) || (!groupId && activeContact === recipient)) {
+                    setMessageStatus(msgId, '…', 'Queued; waiting for connection');
+                }
                 initWebSocket();
             }
         }
@@ -2841,8 +3103,8 @@
                 file = fileInput.files[0];
             }
             
-            if (!activeContact) {
-                alert("Please select a contact before uploading files!");
+            if (!activeContact && !activeGroupId) {
+                alert("Please select a contact or group before uploading files!");
                 fileInput.value = '';
                 return;
             }
@@ -2870,10 +3132,11 @@
                     const msgId = 'msg-' + Date.now();
                     const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
                     const payload = {
-                        type: "send_message",
+                        type: activeGroupId ? "send_group_message" : "send_message",
                         msg_id: msgId,
                         sender: currentUser,
-                        recipient: activeContact,
+                        recipient: activeGroupId ? undefined : activeContact,
+                        group_id: activeGroupId || undefined,
                         content: formattedContent,
                         timestamp: timeStr
                     };
