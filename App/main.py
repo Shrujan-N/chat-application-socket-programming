@@ -1280,6 +1280,10 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     # MULTI_DEVICE_SYNC_FR26: mirror a new outgoing message to the
                     # sender's other logged-in devices before sending the state update.
                     if inserted:
+                        logger.info(
+                            "%s",
+                            content[:80] + ("..." if len(content) > 80 else ""),
+                        )
                         await manager.broadcast_user(username, {
                             "type": "message_sync",
                             "msg_id": msg_id,
@@ -1411,6 +1415,10 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         continue
 
                     if inserted:
+                        logger.info(
+                            "%s",
+                            content[:80] + ("..." if len(content) > 80 else ""),
+                        )
                         frame = {
                             "type": "message_sync",
                             "msg_id": msg_id,
