@@ -122,6 +122,11 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from web_database import get_db, init_db as init_web_db
+from browser_features import (
+    router as browser_features_router,
+    handle_browser_websocket_event,
+    get_group_message_reply_preview,
+)
 from reactions_service import (
     STANDARD_EMOJIS,
     get_reactions_for_message,
@@ -836,6 +841,7 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+app.state.chat_manager = manager
 
 
 # DATA_INTEGRITY_ISSUE_45 + SCALABILITY_ISSUE_42:
@@ -965,6 +971,7 @@ def persist_websocket_group_message(
     integrity_hash: Optional[str] = None,
     mentioned_users: Optional[list[str]] = None,
     group_name: str = "",
+    reply_to_msg_id: Optional[str] = None,
 ):
     """Persist a group message and its mention alerts transactionally."""
     expected_hash = content_sha256(content)
@@ -985,17 +992,17 @@ def persist_websocket_group_message(
             """
             INSERT OR IGNORE INTO messages
                 (msg_id, conversation_type, conversation_id, sender, recipient,
-                 group_id, content, timestamp, status, integrity_hash, mentioned_users)
-            VALUES (?, 'group', ?, ?, '', ?, ?, ?, 'sent', ?, ?)
+                 group_id, content, timestamp, status, integrity_hash, mentioned_users, reply_to_msg_id)
+            VALUES (?, 'group', ?, ?, '', ?, ?, ?, 'sent', ?, ?, ?)
             """,
-            (msg_id, f"group:{group_id}", sender, group_id, content, timestamp, expected_hash, mentions_json),
+            (msg_id, f"group:{group_id}", sender, group_id, content, timestamp, expected_hash, mentions_json, reply_to_msg_id),
         )
         inserted = cursor.rowcount == 1
 
         if not inserted:
             existing = conn.execute(
                 """
-                SELECT sender, conversation_type, group_id, content, timestamp, integrity_hash, mentioned_users
+                SELECT sender, conversation_type, group_id, content, timestamp, integrity_hash, mentioned_users, reply_to_msg_id
                 FROM messages WHERE msg_id = ?
                 """,
                 (msg_id,),
@@ -1007,6 +1014,7 @@ def persist_websocket_group_message(
                 or existing["content"] != content
                 or existing["timestamp"] != timestamp
                 or (existing["mentioned_users"] or "[]") != mentions_json
+                or existing["reply_to_msg_id"] != reply_to_msg_id
                 or not verify_content_sha256(existing["content"], existing["integrity_hash"])
             ):
                 raise ValueError("Message ID conflicts with an existing message")
@@ -1177,6 +1185,8 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 continue
 
             message_type = data.get("type")
+            if await handle_browser_websocket_event(message_type, data, username, websocket, manager):
+                continue
 
             if message_type == "send_message":
                 delivery_started_at = time.perf_counter()
@@ -1361,6 +1371,28 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     })
                     continue
 
+                reply_to_msg_id = data.get("reply_to_msg_id")
+                reply_preview = None
+                if reply_to_msg_id is not None:
+                    if not isinstance(reply_to_msg_id, str) or not reply_to_msg_id.strip():
+                        await websocket.send_json({
+                            "type": "error", "msg_id": msg_id,
+                            "message": "Invalid group reply reference.",
+                        })
+                        continue
+                    reply_to_msg_id = reply_to_msg_id.strip()
+                    try:
+                        reply_preview = get_group_message_reply_preview(reply_to_msg_id, group_id)
+                    except HTTPException as error:
+                        await websocket.send_json({"type": "error", "msg_id": msg_id, "message": error.detail})
+                        continue
+                    if reply_preview is None:
+                        await websocket.send_json({
+                            "type": "error", "msg_id": msg_id,
+                            "message": "The message you are replying to was not found in this group.",
+                        })
+                        continue
+
                 # The server resolves @names against this group's current membership.
                 if e2e_service.is_encrypted_content(content):
                     mentioned_users = e2e_service.filter_client_mentions(
@@ -1384,7 +1416,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     try:
                         inserted = persist_websocket_group_message(
                             msg_id, group_id, username, content, timestamp,
-                            provided_integrity_hash, mentioned_users, group["name"],
+                            provided_integrity_hash, mentioned_users, group["name"], reply_to_msg_id,
                         )
                     except ValueError:
                         await websocket.send_json({
@@ -1433,6 +1465,8 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                             "integrity_hash": content_sha256(content),
                             "id": get_message_row_id(msg_id),
                             "mentioned_users": mentioned_users,
+                            "reply_to_msg_id": reply_to_msg_id,
+                            "reply_preview": reply_preview,
                         }
                         await manager.broadcast_user(username, frame, exclude=websocket)
 
@@ -1457,6 +1491,8 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         "integrity_hash": content_sha256(content),
                         "id": get_message_row_id(msg_id),
                         "mentioned_users": mentioned_users,
+                        "reply_to_msg_id": reply_to_msg_id,
+                        "reply_preview": reply_preview,
                     }
                     await manager.broadcast_many_users(
                         group_members, incoming_frame, exclude_username=username
@@ -2406,7 +2442,7 @@ async def list_my_groups(request: Request):
         rows = conn.execute(
             """
             SELECT g.group_id, g.name, g.icon, g.creator, g.created_at,
-                   COUNT(all_members.username) AS member_count
+                   mine.role AS my_role, COUNT(all_members.username) AS member_count
             FROM groups AS g
             JOIN group_members AS mine ON mine.group_id = g.group_id
             JOIN group_members AS all_members ON all_members.group_id = g.group_id
@@ -2449,12 +2485,17 @@ async def get_group_history(group_id: str, request: Request):
         rows = conn.execute(
             """
             SELECT rowid AS id, msg_id, sender, content, timestamp, status,
-                   integrity_hash, reply_to_msg_id, group_id, conversation_type, mentioned_users
+                   integrity_hash, reply_to_msg_id, group_id, conversation_type, mentioned_users,
+                   edited, edited_at, deleted_everyone
             FROM messages
             WHERE conversation_type = 'group' AND group_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM user_message_deletions d
+                  WHERE d.msg_id = messages.msg_id AND d.username = ?
+              )
             ORDER BY rowid ASC
             """,
-            (group_id,),
+            (group_id, username),
         ).fetchall()
         assert_message_integrity(rows)
         msg_ids = [row["msg_id"] for row in rows if row["msg_id"]]
@@ -2463,7 +2504,9 @@ async def get_group_history(group_id: str, request: Request):
         for row in rows:
             item = dict(row)
             item.pop("integrity_hash", None)
-            item["reply_preview"] = None
+            item["reply_preview"] = get_group_message_reply_preview(
+                item.get("reply_to_msg_id"), group_id
+            )
             try:
                 item["mentioned_users"] = json.loads(item.get("mentioned_users") or "[]")
             except (TypeError, ValueError):
@@ -2511,16 +2554,36 @@ async def mark_mention_notification_read(notification_id: str, request: Request)
 
 # --- Fetch Conversation History Endpoint (ADDED FOR ISSUE #23) ---
 @app.get("/api/messages/history/{user1}/{user2}")
-async def get_chat_history(user1: str, user2: str):
+async def get_chat_history(user1: str, user2: str, request: Request = None):
+    # FastAPI always injects Request for HTTP calls (the middleware enforces a
+    # valid session); the optional value also keeps this handler directly
+    # callable by the legacy unit tests.
+    viewer = current_username(request) if request is not None else None
+    if viewer is not None and viewer not in {user1, user2}:
+        raise HTTPException(status_code=403, detail="You are not part of this conversation")
     conn = get_db()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT msg_id, sender, recipient, content, timestamp, status, integrity_hash, reply_to_msg_id 
-            FROM messages 
-            WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)
-            ORDER BY rowid ASC
-        """, (user1, user2, user2, user1))
+        if viewer is None:
+            cursor.execute("""
+                SELECT msg_id, sender, recipient, content, timestamp, status, integrity_hash,
+                       reply_to_msg_id, edited, edited_at, deleted_everyone
+                FROM messages
+                WHERE ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))
+                ORDER BY rowid ASC
+            """, (user1, user2, user2, user1))
+        else:
+            cursor.execute("""
+                SELECT msg_id, sender, recipient, content, timestamp, status, integrity_hash,
+                       reply_to_msg_id, edited, edited_at, deleted_everyone
+                FROM messages
+                WHERE ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM user_message_deletions d
+                      WHERE d.msg_id = messages.msg_id AND d.username = ?
+                  )
+                ORDER BY rowid ASC
+            """, (user1, user2, user2, user1, viewer))
         rows = cursor.fetchall()
         assert_message_integrity(rows)
         msg_ids = [row["msg_id"] for row in rows if row["msg_id"]]
@@ -2572,20 +2635,26 @@ async def sync_missed_messages(request: Request, since: int = -1):
         rows = conn.execute(
             """
             SELECT rowid AS id, msg_id, sender, recipient, content, timestamp, status,
-                   integrity_hash, reply_to_msg_id, group_id, conversation_type
+                   integrity_hash, reply_to_msg_id, group_id, conversation_type,
+                   edited, edited_at, deleted_everyone
             FROM messages
             WHERE recipient = ? AND rowid > ?
+              AND NOT EXISTS (SELECT 1 FROM user_message_deletions d
+                              WHERE d.msg_id = messages.msg_id AND d.username = ?)
             UNION ALL
             SELECT rowid AS id, msg_id, sender, recipient, content, timestamp, status,
-                   integrity_hash, reply_to_msg_id, group_id, conversation_type
+                   integrity_hash, reply_to_msg_id, group_id, conversation_type,
+                   edited, edited_at, deleted_everyone
             FROM messages
             WHERE conversation_type = 'group'
               AND group_id IN (SELECT group_id FROM group_members WHERE username = ?)
               AND rowid > ?
+              AND NOT EXISTS (SELECT 1 FROM user_message_deletions d
+                              WHERE d.msg_id = messages.msg_id AND d.username = ?)
             ORDER BY id ASC
             LIMIT ?
             """,
-            (username, since, username, since, SYNC_PAGE_LIMIT),
+            (username, since, username, username, since, username, SYNC_PAGE_LIMIT),
         ).fetchall()
         assert_message_integrity(rows)
         messages = [dict(row) for row in rows]
@@ -2593,8 +2662,12 @@ async def sync_missed_messages(request: Request, since: int = -1):
         reactions_map = get_reactions_for_messages(conn, msg_ids)
         for message in messages:
             message.pop("integrity_hash", None)
-            message["reply_preview"] = get_message_reply_preview(
-                message.get("reply_to_msg_id"), message["sender"], message["recipient"]
+            message["reply_preview"] = (
+                get_group_message_reply_preview(message.get("reply_to_msg_id"), message["group_id"])
+                if message.get("conversation_type") == "group"
+                else get_message_reply_preview(
+                    message.get("reply_to_msg_id"), message["sender"], message["recipient"]
+                )
             )
             message["reactions"] = reactions_map.get(message.get("msg_id"), [])
 
@@ -2696,34 +2769,44 @@ async def upload_voice_message(file: UploadFile = File(...)):
 
 # --- Full-Text Search API Endpoint (ADDED FOR ISSUE #31) ---
 @app.get("/api/search")
-async def search_query(username: str, q: str):
+async def search_query(request: Request, username: str = "", q: str = ""):
+    """Legacy search endpoint; identity always comes from the authenticated session.
+
+    The `username` query argument remains accepted for older browser builds, but
+    is intentionally ignored so a caller cannot search another account's data.
+    New browser builds use /api/search/complete for groups and E2E-aware search.
+    """
+    username = current_username(request)
     if not q or len(q.strip()) == 0:
         return {"contacts": [], "messages": []}
- 
+
     search_term = f"%{q.strip()}%"
     conn = get_db()
-    cursor = conn.cursor()
- 
-    # 1. Search Contacts matching search term
-    cursor.execute("""
-        SELECT contact_id FROM contacts 
-        WHERE user_id = ? AND status = 'accepted' AND contact_id LIKE ?
-    """, (username, search_term))
-    contacts = [row["contact_id"] for row in cursor.fetchall()]
- 
-    # 2. Search Messages matching content search term
-    cursor.execute("""
-        SELECT msg_id, sender, recipient, content, timestamp, integrity_hash 
-        FROM messages 
-        WHERE (sender = ? OR recipient = ?) AND content LIKE ?
-        ORDER BY rowid DESC
-    """, (username, username, search_term))
-    message_rows = cursor.fetchall()
-    conn.close()
-    assert_message_integrity(message_rows)
-    messages = []
-    for row in message_rows:
-        item = dict(row)
-        item.pop("integrity_hash", None)
-        messages.append(item)
-    return {"contacts": contacts, "messages": messages}
+    try:
+        contacts = [row["contact_id"] for row in conn.execute("""
+            SELECT contact_id FROM contacts
+            WHERE user_id = ? AND status = 'accepted' AND contact_id LIKE ?
+            ORDER BY contact_id COLLATE NOCASE LIMIT 50
+        """, (username, search_term)).fetchall()]
+        message_rows = conn.execute("""
+            SELECT msg_id, sender, recipient, content, timestamp, integrity_hash
+            FROM messages
+            WHERE (sender = ? OR recipient = ?) AND content LIKE ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM user_message_deletions d
+                  WHERE d.msg_id = messages.msg_id AND d.username = ?
+              )
+            ORDER BY rowid DESC LIMIT 200
+        """, (username, username, search_term, username)).fetchall()
+        assert_message_integrity(message_rows)
+        messages = []
+        for row in message_rows:
+            item = dict(row)
+            item.pop("integrity_hash", None)
+            messages.append(item)
+        return {"contacts": contacts, "messages": messages}
+    finally:
+        conn.close()
+
+# Browser application feature endpoints (group management, complete search, message actions).
+app.include_router(browser_features_router)

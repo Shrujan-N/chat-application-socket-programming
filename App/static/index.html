@@ -729,7 +729,7 @@
                     timestamp: message.timestamp,
                     integrity_hash: message.integrity_hash,
                     mentioned_users: isGroupMessage ? (message.mentioned_users || undefined) : undefined,
-                    reply_to_msg_id: isGroupMessage ? null : (message.reply_to_msg_id || null)
+                    reply_to_msg_id: message.reply_to_msg_id || null
                 }));
                 setMessageStatus(message.msg_id, '…', isRetry ? 'Retrying; waiting for server status' : 'Waiting for server status');
                 return true;
@@ -2577,7 +2577,7 @@
 
                 decryptedHistory.forEach(msg => {
                     if (msg.msg_id) knownIds.add(msg.msg_id);
-                    appendMessageUI(msg.sender, msg.content, msg.timestamp, msg.status, msg.msg_id, msg.reply_preview, msg.mentioned_users || [], msg.reactions || []);
+                    appendMessageUI(msg.sender, msg.content, msg.timestamp, msg.status, msg.msg_id, msg.reply_preview, msg.mentioned_users || [], msg.reactions || [], msg.edited, msg.deleted_everyone);
                 });
 
                 // Keep queued messages visible after refresh until the server acknowledges them.
@@ -2673,9 +2673,9 @@
                 noteSeenId(data.id);
                 rememberLiveId(data.msg_id);
                 if (data.group_id && activeGroupId === data.group_id) {
-                    appendMessageUI(currentUser, data.content, data.timestamp, data.status || 'sent', data.msg_id, null, data.mentioned_users || []);
+                    appendMessageUI(currentUser, data.content, data.timestamp, data.status || 'sent', data.msg_id, data.reply_preview || null, data.mentioned_users || [], [], data.edited, data.deleted_everyone);
                 } else if (!data.group_id && activeContact === data.recipient) {
-                    appendMessageUI(currentUser, data.content, data.timestamp, data.status || 'sent', data.msg_id);
+                    appendMessageUI(currentUser, data.content, data.timestamp, data.status || 'sent', data.msg_id, data.reply_preview || null, [], [], data.edited, data.deleted_everyone);
                 }
                 return;
             }
@@ -2684,7 +2684,7 @@
                 rememberLiveId(data.msg_id);
                 if (data.group_id) {
                     if (activeGroupId === data.group_id) {
-                        appendMessageUI(data.sender, data.content, data.timestamp, 'delivered', data.msg_id, null, data.mentioned_users || []);
+                        appendMessageUI(data.sender, data.content, data.timestamp, 'delivered', data.msg_id, data.reply_preview || null, data.mentioned_users || [], [], data.edited, data.deleted_everyone);
                     } else {
                         showToast(`New message in ${data.group_name || 'a group chat'} from @${data.sender}.`);
                     }
@@ -2699,7 +2699,7 @@
                     }
                 }
                 if (activeContact === data.sender) {
-                    appendMessageUI(data.sender, data.content, data.timestamp, 'delivered', data.msg_id, data.reply_preview);
+                    appendMessageUI(data.sender, data.content, data.timestamp, 'delivered', data.msg_id, data.reply_preview, [], [], data.edited, data.deleted_everyone);
                     
                     // Send Read Receipt ACK back to sender (ADDED FOR ISSUE #22)
                     ws.send(JSON.stringify({
@@ -2868,7 +2868,7 @@
                 ? crypto.randomUUID()
                 : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
             const groupIdAtSend = activeGroupId;
-            const reply = groupIdAtSend ? null : (replyingTo ? { ...replyingTo } : null);
+            const reply = replyingTo ? { ...replyingTo } : null;
             const payload = {
                 type: groupIdAtSend ? 'send_group_message' : 'send_message',
                 msg_id: msgId,
@@ -3118,6 +3118,7 @@
             const quote = createReplyQuote(replyPreview);
             if (quote) body.appendChild(quote);
             const contentElement = document.createElement('div');
+            contentElement.className = 'message-content';
             contentElement.innerHTML = content;
             highlightMentionedUsers(contentElement, mentionedUsers);
             body.appendChild(contentElement);
@@ -4134,5 +4135,6 @@
         }
 
     </script>
+    <script src="/static/browser_features.js"></script>
 </body>
 </html>
