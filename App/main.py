@@ -219,7 +219,7 @@ async def require_session(request: Request, call_next):
                     request.method,
                     path,
                 )
-            detail = str(exc) if str(exc) else "Authentication required"
+            detail = "Session expired" if str(exc) == "Session expired" else "Authentication required"
             response = JSONResponse(
                 status_code=401,
                 content={"detail": detail},

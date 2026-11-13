@@ -1,4 +1,9 @@
 """Regression tests for FR-24 message replies and quoted navigation metadata."""
+import sys as _sys
+from pathlib import Path as _Path
+_APP_DIR = _Path(__file__).resolve().parent.parent / "App"
+if str(_APP_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_APP_DIR))
 import asyncio
 import os
 import tempfile

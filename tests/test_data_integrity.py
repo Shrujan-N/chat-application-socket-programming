@@ -6,7 +6,7 @@ import subprocess
 import sys
 import textwrap
 
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(__file__).resolve().parent.parent / "App"
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 

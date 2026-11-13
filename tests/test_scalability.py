@@ -14,7 +14,7 @@ _TMP_DIR = tempfile.mkdtemp(prefix="chat_scalability_test_")
 os.environ.setdefault("CHAT_DB_PATH", os.path.join(_TMP_DIR, "test_scalability.db"))
 os.environ.setdefault("JWT_SECRET", "test-scalability-secret")
 
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(__file__).resolve().parent.parent / "App"
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 

@@ -5,6 +5,11 @@ function that records what would have been sent.
 
 Run from the project root:     pytest -v
 """
+import sys as _sys
+from pathlib import Path as _Path
+_APP_DIR = _Path(__file__).resolve().parent.parent / "App"
+if str(_APP_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_APP_DIR))
 import os
 import sqlite3
 import tempfile

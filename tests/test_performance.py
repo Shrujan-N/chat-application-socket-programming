@@ -1,4 +1,9 @@
 """Regression tests for NFR-01 Performance / Latency."""
+import sys as _sys
+from pathlib import Path as _Path
+_APP_DIR = _Path(__file__).resolve().parent.parent / "App"
+if str(_APP_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_APP_DIR))
 import performance
 import time
 from fastapi.testclient import TestClient
@@ -95,7 +100,7 @@ def test_latency_endpoint_requires_authentication():
 
 def test_application_and_browser_wire_latency_measurements():
     from pathlib import Path
-    app_dir = Path(__file__).resolve().parent
+    app_dir = Path(__file__).resolve().parent.parent / "App"
     main_source = (app_dir / "main.py").read_text(encoding="utf-8")
     browser = (app_dir / "static" / "index.html").read_text(encoding="utf-8")
     assert "performance_metrics.begin_delivery(" in main_source

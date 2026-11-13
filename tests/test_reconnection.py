@@ -3,6 +3,11 @@
 Run from the App directory:  python -m pytest test_reconnection.py -v
 Uses a temporary database so a developer's chat_app.db is never touched.
 """
+import sys as _sys
+from pathlib import Path as _Path
+_APP_DIR = _Path(__file__).resolve().parent.parent / "App"
+if str(_APP_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_APP_DIR))
 import os
 import tempfile
 

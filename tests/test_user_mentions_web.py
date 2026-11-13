@@ -1,4 +1,9 @@
 """Regression tests for FR-25 web group @mentions."""
+import sys as _sys
+from pathlib import Path as _Path
+_APP_DIR = _Path(__file__).resolve().parent.parent / "App"
+if str(_APP_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_APP_DIR))
 import os
 import tempfile
 import uuid
@@ -114,7 +119,7 @@ def test_mentions_api_requires_authentication():
 
 
 def test_web_ui_exposes_group_mention_suggestions_and_notifications():
-    html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).resolve().parent.parent / "App" / "static" / "index.html").read_text(encoding="utf-8")
     assert 'id="mention-suggestions"' in html
     assert "handleMentionInput(event)" in html
     assert "handleMessageInputKeydown(event)" in html

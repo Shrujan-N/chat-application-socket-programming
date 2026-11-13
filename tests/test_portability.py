@@ -1,7 +1,12 @@
 """Responsive layout regression tests for Issue #49."""
+import sys as _sys
+from pathlib import Path as _Path
+_APP_DIR = _Path(__file__).resolve().parent.parent / "App"
+if str(_APP_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_APP_DIR))
 from pathlib import Path
 
-PAGE = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+PAGE = (Path(__file__).resolve().parent.parent / "App" / "static" / "index.html").read_text(encoding="utf-8")
 
 
 def test_viewport_is_configured_for_mobile_devices():

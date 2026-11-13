@@ -1,4 +1,9 @@
 """Regression tests for web group creation, membership, history, and live delivery."""
+import sys as _sys
+from pathlib import Path as _Path
+_APP_DIR = _Path(__file__).resolve().parent.parent / "App"
+if str(_APP_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_APP_DIR))
 import os
 import tempfile
 import uuid
@@ -192,7 +197,7 @@ def test_group_messages_are_included_in_offline_sync_for_members():
 
 
 def test_group_chat_ui_has_creation_selection_and_group_message_hooks():
-    html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).resolve().parent.parent / "App" / "static" / "index.html").read_text(encoding="utf-8")
     assert 'onclick="openCreateGroupDialog()"' in html
     assert 'id="create-group-dialog"' in html
     assert "async function createGroup(event)" in html
@@ -401,8 +406,8 @@ def test_browser_complete_search_finds_group_names_and_group_message_candidates(
 
 
 def test_browser_features_script_is_loaded_and_exposes_srs_controls():
-    html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
-    script = (Path(__file__).parent / "static" / "browser_features.js").read_text(encoding="utf-8")
+    html = (Path(__file__).resolve().parent.parent / "App" / "static" / "index.html").read_text(encoding="utf-8")
+    script = (Path(__file__).resolve().parent.parent / "App" / "static" / "browser_features.js").read_text(encoding="utf-8")
     assert '<script src="/static/browser_features.js"></script>' in html
     assert "typing_stop" in script and "is typing" in script
     assert "Save group details" in script and "Make admin" in script

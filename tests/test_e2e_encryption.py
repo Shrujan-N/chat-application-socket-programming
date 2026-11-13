@@ -15,7 +15,7 @@ _TMP_DIR = tempfile.mkdtemp(prefix="chat_e2e_test_")
 os.environ.setdefault("CHAT_DB_PATH", os.path.join(_TMP_DIR, "test_e2e.db"))
 os.environ.setdefault("JWT_SECRET", "test-e2e-secret")
 
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(__file__).resolve().parent.parent / "App"
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 

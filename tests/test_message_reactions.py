@@ -16,7 +16,7 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "App"))
 
 _tmp = tempfile.mkdtemp(prefix="chat_reactions_test_")
 os.environ["CHAT_DB_PATH"] = os.path.join(_tmp, "reactions_test.db")
