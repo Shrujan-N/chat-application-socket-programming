@@ -665,7 +665,7 @@ async def _measure_routing_wave(
     ] + [
         (lambda idx=i: send_group(idx)) for i in range(group_broadcasts)
     ]
-    await gather_bounded(factories, batch_size=BROADCAST_BATCH_SIZE)
+    await gather_bounded(factories, batch_size=min(BROADCAST_BATCH_SIZE, 32))
     wave_duration_ms = (time.perf_counter() - wave_started) * 1000.0
 
     sorted_latencies = sorted(latencies_ms)
