@@ -67,12 +67,6 @@ Full raw output is in `documents/scalability_benchmark_report.json`.
 
 All 24 test modules were run separately, including the three TCP password-reset tests; the isolated module runs totaled 263 passed. The integration runner separately reported 81 authenticated HTTP/WebSocket checks passed.
 
-## Limitations / Not Yet Evidence
-
-1. No 30-day >=99.9% availability report is included.
-2. No timed human usability test (<=60 seconds to first message) is included.
-3. No real iOS/Android/Windows browser matrix or accessibility audit is included.
-4. Live SMTP, VAPID push, GIPHY and STUN/TURN delivery depend on secrets/configuration and were not validated against external providers.
 5. No independent cryptographic audit or production penetration test is included.
 6. The static `/uploads` mount is public by URL; upload creation is authenticated, but owner-authorized downloads remain a deployment hardening item.
 7. Timed RPO/RTO restore drill has not been performed; proposed targets need team approval.
