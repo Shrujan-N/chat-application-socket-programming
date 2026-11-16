@@ -1,0 +1,74 @@
+{
+  "report_title": "NFR-02 Scalability Benchmark Report",
+  "project": "Chat Application (Socket Programming)",
+  "requirement": {
+    "id": "NFR-02",
+    "description": "Architecture must support 100,000 concurrent users with no degradation in performance.",
+    "acceptance_targets": {
+      "concurrent_users": 100000,
+      "p95_latency_ms_max": 200.0,
+      "delivery_rate_percent_min": 99.9,
+      "dropped_connections_max": 0,
+      "errors_max": 0
+    }
+  },
+  "evidence": {
+    "run_date": "2026-11-11",
+    "source": "documents/Test_Execution_Report.md, Benchmark Output section",
+    "evidence_type": "previously recorded benchmark result",
+    "execution_mode": "virtual/in-memory simulation",
+    "real_network_load_test": false,
+    "note": "This report transcribes the benchmark metrics recorded in the test execution report. It is not a claim that a new benchmark was executed while preparing this file. The GitHub Actions workflow runs a fresh benchmark on each applicable push or pull request and uploads its raw output as an artifact."
+  },
+  "configuration": {
+    "concurrent_users": 100000,
+    "concurrent_connections": 100000,
+    "gateway_nodes": 4,
+    "messages_sent": 9200,
+    "benchmark_implementation": "App/scalability.py",
+    "test_coverage": "tests/test_scalability.py"
+  },
+  "results": {
+    "messages_delivered": 9200,
+    "delivery_rate_percent": 100.0,
+    "latency_ms": {
+      "p95": 21.176,
+      "target_p95": 200.0
+    },
+    "dropped_connections": 0,
+    "error_count": 0,
+    "nfr02_passed": true
+  },
+  "acceptance_evaluation": {
+    "concurrent_user_target_met": true,
+    "p95_latency_target_met": true,
+    "delivery_rate_target_met": true,
+    "zero_dropped_connections_met": true,
+    "zero_errors_met": true,
+    "overall_result": "PASS",
+    "qualification": "PASS applies to the virtual/in-memory benchmark only. It does not establish capacity for 100,000 real internet-connected clients or production infrastructure."
+  },
+  "unreported_metrics": {
+    "connect_duration_ms": null,
+    "connections_per_second": null,
+    "routing_duration_ms": null,
+    "messages_per_second": null,
+    "latency_avg_ms": null,
+    "latency_p50_ms": null,
+    "latency_p99_ms": null,
+    "latency_max_ms": null,
+    "lock_stripes_used": null,
+    "ramp_stages": null,
+    "reason": "The summary recorded in Test_Execution_Report.md does not provide these raw fields. They are intentionally left null rather than estimated or invented."
+  },
+  "limitations": [
+    "The benchmark uses virtual clients and in-memory gateway/pub-sub components.",
+    "It is not a real 100,000-client network or internet load test.",
+    "It does not establish production infrastructure, database, operating-system, or network capacity.",
+    "A fresh CI execution produces the raw benchmark output as a downloadable GitHub Actions artifact."
+  ],
+  "recommended_follow_up": [
+    "Run the GitHub Actions workflow and retain the uploaded scalability-benchmark-report artifact.",
+    "If production-scale claims are required, perform a controlled multi-process and real-network load test against the intended deployment environment."
+  ]
+}
