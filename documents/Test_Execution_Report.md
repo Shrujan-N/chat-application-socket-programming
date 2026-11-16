@@ -43,31 +43,3 @@
 | `test_web_security.py` | 6 passed |
 | **Total** | **263 passed** |
 
-## Benchmark Output
-
-```json
-{
-  "concurrent_users": 100000,
-  "concurrent_connections": 100000,
-  "gateway_nodes": 4,
-  "messages_sent": 9200,
-  "messages_delivered": 9200,
-  "delivery_rate_percent": 100.0,
-  "latency_ms": {
-    "p95": 21.176,
-    "target_p95": 200.0
-  },
-  "dropped_connections": 0,
-  "error_count": 0,
-  "nfr02_passed": true
-}
-```
-
-Full raw output is in `documents/scalability_benchmark_report.json`.
-
-All 24 test modules were run separately, including the three TCP password-reset tests; the isolated module runs totaled 263 passed. The integration runner separately reported 81 authenticated HTTP/WebSocket checks passed.
-
-5. No independent cryptographic audit or production penetration test is included.
-6. The static `/uploads` mount is public by URL; upload creation is authenticated, but owner-authorized downloads remain a deployment hardening item.
-7. Timed RPO/RTO restore drill has not been performed; proposed targets need team approval.
-8. The GitHub Actions workflow is part of the pending local patch. It will need to be committed and pushed before remote CI execution can be reported.
