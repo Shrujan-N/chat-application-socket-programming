@@ -36,7 +36,7 @@ def make_auth_headers():
 def test_gif_config_requires_authentication():
     response = web.get("/api/gifs/config")
     assert response.status_code == 401
-    assert response.json()["detail"] == "Authentication required"
+    assert response.json()["detail"] == "Not authenticated"
 
 
 def test_gif_config_is_disabled_when_key_is_missing(monkeypatch):
